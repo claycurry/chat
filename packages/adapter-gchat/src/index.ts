@@ -1,6 +1,7 @@
 import type {
   ActionEvent,
   Adapter,
+  AdapterPostableMessage,
   Attachment,
   ChatInstance,
   EmojiValue,
@@ -9,7 +10,6 @@ import type {
   FormattedContent,
   Logger,
   Message,
-  PostableMessage,
   RawMessage,
   ReactionEvent,
   StateAdapter,
@@ -1112,7 +1112,7 @@ export class GoogleChatAdapter implements Adapter<GoogleChatThreadId, unknown> {
 
   async postMessage(
     threadId: string,
-    message: PostableMessage,
+    message: AdapterPostableMessage,
   ): Promise<RawMessage<unknown>> {
     const { spaceName, threadName } = this.decodeThreadId(threadId);
 
@@ -1208,10 +1208,10 @@ export class GoogleChatAdapter implements Adapter<GoogleChatThreadId, unknown> {
   }
 
   /**
-   * Extract card element from a PostableMessage if present.
+   * Extract card element from a message if present.
    */
   private extractCard(
-    message: PostableMessage,
+    message: AdapterPostableMessage,
   ): import("chat").CardElement | null {
     if (isCardElement(message)) {
       return message;
@@ -1223,9 +1223,9 @@ export class GoogleChatAdapter implements Adapter<GoogleChatThreadId, unknown> {
   }
 
   /**
-   * Extract files from a PostableMessage if present.
+   * Extract files from a message if present.
    */
-  private extractFiles(message: PostableMessage): FileUpload[] {
+  private extractFiles(message: AdapterPostableMessage): FileUpload[] {
     if (typeof message === "object" && message !== null && "files" in message) {
       return (message as { files?: FileUpload[] }).files ?? [];
     }
@@ -1296,7 +1296,7 @@ export class GoogleChatAdapter implements Adapter<GoogleChatThreadId, unknown> {
   async editMessage(
     threadId: string,
     messageId: string,
-    message: PostableMessage,
+    message: AdapterPostableMessage,
   ): Promise<RawMessage<unknown>> {
     try {
       // Check if message contains a card

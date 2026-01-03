@@ -15,8 +15,23 @@ export default function Home() {
         <li>
           <code>/api/webhooks/gchat</code> - Google Chat events
         </li>
+      </ul>
+
+      <h2>Features</h2>
+      <ul>
         <li>
-          <code>/api/webhooks/discord</code> - Discord events
+          <strong>AI Mode</strong> - Mention the bot with &quot;AI&quot; to
+          enable AI assistant mode (uses Claude)
+        </li>
+        <li>
+          <strong>Rich Cards</strong> - Interactive cards with buttons
+        </li>
+        <li>
+          <strong>Reactions</strong> - React to bot messages and it reacts back
+        </li>
+        <li>
+          <strong>DM Support</strong> - Say &quot;DM me&quot; to get a direct
+          message
         </li>
       </ul>
 
@@ -37,12 +52,6 @@ TEAMS_APP_PASSWORD=...`}
 
       <h3>Google Chat</h3>
       <pre>{`GOOGLE_CHAT_CREDENTIALS={"type":"service_account",...}`}</pre>
-
-      <h3>Discord</h3>
-      <pre>
-        {`DISCORD_BOT_TOKEN=...
-DISCORD_PUBLIC_KEY=...`}
-      </pre>
     </main>
   );
 }

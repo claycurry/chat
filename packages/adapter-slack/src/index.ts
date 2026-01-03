@@ -3,6 +3,7 @@ import { WebClient } from "@slack/web-api";
 import type {
   ActionEvent,
   Adapter,
+  AdapterPostableMessage,
   Attachment,
   ChatInstance,
   EmojiValue,
@@ -11,7 +12,6 @@ import type {
   FormattedContent,
   Logger,
   Message,
-  PostableMessage,
   RawMessage,
   ReactionEvent,
   StreamOptions,
@@ -631,7 +631,7 @@ export class SlackAdapter implements Adapter<SlackThreadId, unknown> {
 
   async postMessage(
     threadId: string,
-    message: PostableMessage,
+    message: AdapterPostableMessage,
   ): Promise<RawMessage<unknown>> {
     const { channel, threadTs } = this.decodeThreadId(threadId);
 
@@ -731,10 +731,10 @@ export class SlackAdapter implements Adapter<SlackThreadId, unknown> {
   }
 
   /**
-   * Extract card element from a PostableMessage if present.
+   * Extract card element from a AdapterPostableMessage if present.
    */
   private extractCard(
-    message: PostableMessage,
+    message: AdapterPostableMessage,
   ): import("chat").CardElement | null {
     if (isCardElement(message)) {
       return message;
@@ -746,9 +746,9 @@ export class SlackAdapter implements Adapter<SlackThreadId, unknown> {
   }
 
   /**
-   * Extract files from a PostableMessage if present.
+   * Extract files from a AdapterPostableMessage if present.
    */
-  private extractFiles(message: PostableMessage): FileUpload[] {
+  private extractFiles(message: AdapterPostableMessage): FileUpload[] {
     if (typeof message === "object" && message !== null && "files" in message) {
       return (message as { files?: FileUpload[] }).files ?? [];
     }
@@ -830,7 +830,7 @@ export class SlackAdapter implements Adapter<SlackThreadId, unknown> {
   async editMessage(
     threadId: string,
     messageId: string,
-    message: PostableMessage,
+    message: AdapterPostableMessage,
   ): Promise<RawMessage<unknown>> {
     const { channel } = this.decodeThreadId(threadId);
 
