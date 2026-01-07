@@ -819,7 +819,6 @@ describe("typing indicators", () => {
     // @ts-expect-error accessing private property for testing
     adapter.client = { apiCall: mockApiCall };
     await adapter.startTyping("slack:C123:1234567890.123456", "is analyzing your request...");
-
     expect(mockApiCall).toHaveBeenCalledWith("assistant.threads.setStatus", {
       channel_id: "C123",
       thread_ts: "1234567890.123456",
@@ -837,7 +836,6 @@ describe("typing indicators", () => {
 
     // @ts-expect-error accessing private property for testing
     adapter.client = { apiCall: mockApiCall };
-
     await adapter.stopTyping("slack:C123:1234567890.123456");
     expect(mockApiCall).toHaveBeenCalledWith("assistant.threads.setStatus", {
       channel_id: "C123",
