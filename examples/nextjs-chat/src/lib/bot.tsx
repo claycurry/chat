@@ -197,8 +197,6 @@ bot.onModalSubmit("feedback_form", async (event) => {
     email,
     user: event.user.userName,
   });
-  console.log("relatedThread", JSON.stringify(event.relatedThread, null, 2));
-  console.log("relatedMessage", JSON.stringify(event.relatedMessage, null, 2));
   await event.relatedMessage?.edit(`${emoji.check} **Feedback received!**`);
   await event.relatedThread?.post(
     <Card title={`${emoji.check} Feedback received!`}>
