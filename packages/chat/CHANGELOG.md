@@ -1,5 +1,17 @@
 # chat
 
+## 4.7.1
+
+### Patch Changes
+
+- 160f1f7: Fetch relatedMessage separately from the event thread.
+
+## 4.7.0
+
+### Minor Changes
+
+- a13f43e: Add relatedThread and relatedMessage to modal events.
+
 ## 4.6.0
 
 ### Minor Changes
