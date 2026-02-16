@@ -1,4 +1,4 @@
-# RFC: Workflow-Based Modal Actions with `"use step"`
+# RFC: Callback URL-Based Modal Actions
 
 **Status:** Draft
 **Author:** v0
@@ -6,7 +6,7 @@
 
 ## Summary
 
-Replace the current `bot.onAction` / `bot.onModalSubmit` / `bot.onModalClose` string-matcher pattern with an inline, awaitable modal API powered by [Workflow DevKit](https://useworkflow.dev). Instead of scattering handler registration across the file and correlating them through `callbackId` strings, modals become a single awaitable expression inside a `"use workflow"` function. The workflow suspends when a modal is opened, and resumes with the user's submitted values when they interact with it.
+Add an optional `callbackUrl` parameter to `openModal()` and an `onAction` prop to `<Button>` components. When a `callbackUrl` is provided, the platform adapter POSTs the event payload to that URL instead of routing through `bot.onModalSubmit` / `bot.onModalClose` string-matcher handlers. This keeps chat-sdk internals simple while enabling powerful composition with [Workflow DevKit](https://useworkflow.dev)'s `createHook` for awaitable, durable interactions -- without requiring a custom compiler or the `"use workflow"` directive.
 
 ## Motivation
 
@@ -62,8 +62,10 @@ What if a modal interaction was just an `await`?
 bot.onAction("feedback", async (event) => {
   "use workflow";
 
-  const result = await event.openModal(
-    <Modal title="Send Feedback" submitLabel="Send">
+  const hook = createHook<ModalResult>();
+
+  await event.openModal(
+    <Modal title="Send Feedback" submitLabel="Send" callbackUrl={hook.url}>
       <TextInput id="message" label="Your Feedback" multiline />
       <Select id="category" label="Category">
         <SelectOption label="Bug Report" value="bug" />
@@ -72,86 +74,130 @@ bot.onAction("feedback", async (event) => {
     </Modal>,
   );
 
+  // Workflow suspends here -- resumes when the user submits
+  const result = await hook;
+
   // This code runs after the user submits -- same scope, same function
   await event.thread.post(`Feedback (${result.values.category}): ${result.values.message}`);
 });
 ```
 
-No `callbackId`. No `onModalSubmit`. No `privateMetadata`. The workflow suspends when the modal opens and resumes with the form values when the user submits. Cancellation is just a try/catch.
+No `bot.onModalSubmit`. No `privateMetadata`. The workflow suspends when the modal opens and resumes with the form values when the user submits. Cancellation is just a try/catch.
+
+**Crucially, this doesn't require a custom compiler.** The `callbackUrl` prop is a simple, portable concept that works in any environment. Workflow DevKit's `createHook` provides the awaitable URL, but you could just as easily point `callbackUrl` at your own Express route. chat-sdk stays simple -- it just POSTs to the URL.
 
 ## Design
 
-### Core Primitive: `openModal` Returns a Promise
+### Core Primitive: `callbackUrl` on Modals
 
-Today `event.openModal()` returns `Promise<{ viewId: string } | undefined>` -- it fires and forgets. Under the workflow model, it returns `Promise<ModalResult>` -- a promise that **suspends the workflow** until the user submits or closes the modal.
-
-Under the hood, this maps directly to Workflow DevKit's `createWebhook()` pattern. Per the WDK docs, `createWebhook()` returns a `Webhook` object where `await webhook` resolves to a standard `Request` (or `RequestWithResponse` for dynamic responses). The adapter POSTs the modal event data as JSON to `webhook.url`, and the workflow reads it via `request.json()`.
-
-The implementation is split into orchestration (workflow function) and actual work (step functions), following WDK best practices -- workflow functions orchestrate, step functions have full Node.js access:
+Today `event.openModal()` fires and forgets. This RFC adds an optional `callbackUrl` parameter. When present, the adapter POSTs the modal event (submit/close) to that URL instead of routing through the internal `processModalSubmit()` / `processModalClose()` handlers.
 
 ```ts
-import { createWebhook, type RequestWithResponse } from "workflow";
+// The openModal signature gains callbackUrl support via the Modal element
+await event.openModal(
+  <Modal title="Feedback" callbackUrl="https://my-app.com/api/hooks/abc123">
+    <TextInput id="message" label="Message" />
+  </Modal>,
+);
+```
 
-// Step function: opens the modal on the platform (needs Node.js / adapter access)
-async function platformOpenModal(
-  adapter: Adapter,
-  triggerId: string,
-  modalElement: ModalElement,
-  webhookUrl: string,
-): Promise<{ viewId: string }> {
-  "use step";
-  return adapter.openModal(triggerId, modalElement, undefined, { webhookUrl });
-}
+When the user submits, the adapter POSTs to `callbackUrl`:
 
-// Step function: parses the webhook request (respondWith must be in a step)
-async function parseModalWebhook(
-  request: RequestWithResponse,
-): Promise<ModalWebhookPayload> {
-  "use step";
-  const data = await request.json();
-
-  // For validation flows: send a synchronous response back to the platform
-  // (e.g., Slack expects `response_action: "errors"` in the HTTP response)
-  // This is handled later via respondWith() -- see Validation Loop section
-  return data;
-}
-
-// Conceptual implementation inside the Chat class
-async openModal(modal: ModalElement | CardJSXElement): Promise<ModalResult> {
-  "use workflow";
-
-  // createWebhook() -- no type parameter; always resolves to Request
-  const webhook = createWebhook({ respondWith: "manual" });
-
-  // Step: open the modal on the platform, passing webhook.url as the callback
-  await platformOpenModal(adapter, triggerId, modalElement, webhook.url);
-
-  // Workflow suspends here -- no compute consumed while user fills the form
-  const request = await webhook;
-
-  // Step: parse the request body
-  const data = await parseModalWebhook(request);
-
-  if (data.type === "submit") {
-    return { action: "submit", values: data.values, user: data.user };
-  }
-
-  throw new ModalClosedError(data.user);
+```json
+{
+  "type": "submit",
+  "values": { "message": "Great product!" },
+  "user": { "id": "U123", "userName": "alice" },
+  "viewId": "V456"
 }
 ```
 
-Key WDK patterns used here:
+When the user closes/cancels:
 
-- **`createWebhook()`** -- no generic type parameter (unlike `createHook<T>()`). Always resolves to `Request`.
-- **`respondWith: "manual"`** -- enables dynamic HTTP responses from step functions, critical for the validation loop (Slack needs `{ response_action: "errors" }` in the synchronous HTTP response).
-- **Step functions for all "real work"** -- `platformOpenModal` and `parseModalWebhook` are `"use step"` functions with full Node.js access. The workflow function only orchestrates.
-- **`respondWith()` called from step functions** -- per WDK docs, `request.respondWith()` must be called inside a `"use step"` function.
+```json
+{
+  "type": "close",
+  "user": { "id": "U123", "userName": "alice" },
+  "viewId": "V456"
+}
+```
 
-The workflow **suspends** at `await webhook`. When the platform sends the modal submission back to chat-sdk, instead of routing to `onModalSubmit` handlers, the adapter POSTs to `webhook.url` to resume the workflow with the submitted data.
+This is the only change chat-sdk needs internally. Everything else is layered on top.
+
+### Composition with Workflow DevKit's `createHook`
+
+[Workflow DevKit](https://useworkflow.dev)'s `createHook<T>()` returns a hook object with a `.url` property and is itself awaitable -- `await hook` suspends the workflow until someone POSTs to `hook.url`, then resolves to the parsed payload typed as `T`. This maps perfectly to the `callbackUrl` pattern:
+
+```ts
+import { createHook } from "workflow";
+
+bot.onAction("feedback", async (event) => {
+  "use workflow";
+
+  const hook = createHook<ModalResult>();
+
+  await event.openModal(
+    <Modal title="Send Feedback" submitLabel="Send" callbackUrl={hook.url}>
+      <TextInput id="message" label="Your Feedback" multiline />
+    </Modal>,
+  );
+
+  // Workflow suspends here -- no compute consumed while user fills the form
+  const result = await hook;
+
+  await event.thread.post(`Feedback: ${result.values.message}`);
+});
+```
+
+Key points:
+
+- **`createHook<T>()`** -- returns a typed hook. `await hook` resolves to `T` (here, `ModalResult`). This is different from `createWebhook()` which always resolves to `Request`.
+- **`hook.url`** -- the URL that chat-sdk POSTs to. Workflow DevKit manages the resumption.
+- **No compiler needed** -- `"use workflow"` is Workflow DevKit's standard directive, not a custom chat-sdk compiler. And `callbackUrl` works without it.
+
+### `callbackUrl` on Button Components
+
+Similarly, `<Button>` gains an optional `callbackUrl` prop. When a user clicks the button, the adapter POSTs the action event to that URL instead of routing through `processAction()`:
+
+```tsx
+thread.post(
+  <Card>
+    <Actions>
+      <Button callbackUrl="https://my-app.com/api/hooks/xyz789">
+        Approve
+      </Button>
+    </Actions>
+  </Card>,
+);
+```
+
+With Workflow DevKit:
+
+```tsx
+async function approvalFlow(thread: Thread) {
+  "use workflow";
+
+  const hook = createHook<ActionEvent>();
+
+  await thread.post(
+    <Card>
+      <Text>New request needs approval.</Text>
+      <Actions>
+        <Button callbackUrl={hook.url}>Approve</Button>
+      </Actions>
+    </Card>,
+  );
+
+  // Workflow suspends -- resumes when someone clicks "Approve"
+  const event = await hook;
+
+  await thread.post(`Approved by ${event.user.userName}!`);
+}
+```
 
 ### Inline `onAction` on Button Components
 
-Currently, buttons use an `id` prop and action handlers are registered separately via `bot.onAction("id", handler)`. This RFC proposes an additional `onAction` prop that binds the handler inline:
+In addition to `callbackUrl`, this RFC also proposes an `onAction` prop for convenience when you want to define the handler inline without a separate URL:
 
 ```tsx
 // Current pattern -- string coupling
@@ -161,7 +207,6 @@ bot.onAction("approve", async (event) => { /* ... */ });
 
 // Proposed pattern -- inline binding
 <Button onAction={async (event) => {
-  "use workflow";
   await event.thread.post("Approved!");
 }}>
   Approve
@@ -173,17 +218,16 @@ bot.onAction("approve", async (event) => { /* ... */ });
 1. When the JSX is rendered, `onAction` closures are registered in a per-render handler map keyed by an auto-generated action ID.
 2. The `id` prop is auto-generated (e.g., `action_<hash>`) and embedded in the platform payload.
 3. When the platform sends back the action event, the Chat class looks up the closure by auto-generated ID and invokes it.
-4. Since the closure is a `"use workflow"` function, it becomes a durable workflow run that can suspend/resume.
 
-The existing `id` + `bot.onAction()` pattern continues to work -- `onAction` is purely additive.
+The existing `id` + `bot.onAction()` pattern continues to work -- `onAction` and `callbackUrl` are purely additive.
 
 ### Type-Safe Modal Results
 
-The `openModal` return type encodes the form field IDs and types from the modal definition:
+The `ModalResult` type encodes the form field IDs and types:
 
 ```ts
 interface ModalResult<TValues extends Record<string, string> = Record<string, string>> {
-  action: "submit";
+  type: "submit";
   values: TValues;
   user: Author;
   viewId: string;
@@ -191,11 +235,13 @@ interface ModalResult<TValues extends Record<string, string> = Record<string, st
 }
 ```
 
-With generics on the Modal component, we can infer the shape:
+With `createHook<T>()`, the type flows through naturally:
 
 ```tsx
-const result = await event.openModal(
-  <Modal<{ message: string; category: string }> title="Feedback">
+const hook = createHook<ModalResult<{ message: string; category: string }>>();
+
+await event.openModal(
+  <Modal title="Feedback" callbackUrl={hook.url}>
     <TextInput id="message" label="Message" />
     <Select id="category" label="Category">
       <SelectOption label="Bug" value="bug" />
@@ -204,6 +250,7 @@ const result = await event.openModal(
   </Modal>,
 );
 
+const result = await hook;
 result.values.message;  // string -- type-safe
 result.values.category; // string -- type-safe
 result.values.typo;     // TypeScript error
@@ -211,18 +258,19 @@ result.values.typo;     // TypeScript error
 
 ### Validation Loop
 
-Server-side validation that sends error messages back to the modal (Slack's `response_action: "errors"` pattern) becomes a simple loop:
+Server-side validation that sends error messages back to the modal (Slack's `response_action: "errors"` pattern) becomes a simple loop when combined with workflow:
 
 ```tsx
 bot.onAction("report", async (event) => {
   "use workflow";
 
-  let result: ModalResult;
   let errors: Record<string, string> | null = null;
 
-  do {
-    result = await event.openModal(
-      <Modal title="Report Bug" submitLabel="Submit" errors={errors}>
+  while (true) {
+    const hook = createHook<ModalResult>();
+
+    await event.openModal(
+      <Modal title="Report Bug" submitLabel="Submit" callbackUrl={hook.url} errors={errors}>
         <TextInput id="title" label="Bug Title" />
         <TextInput id="steps" label="Steps to Reproduce" multiline />
         <Select id="severity" label="Severity">
@@ -233,43 +281,45 @@ bot.onAction("report", async (event) => {
       </Modal>,
     );
 
-    errors = null;
+    const result = await hook;
+
     if (result.values.title.length < 3) {
       errors = { title: "Title must be at least 3 characters" };
+      continue;
     }
-  } while (errors);
 
-  await event.thread.post(`Bug filed: ${result.values.title} (${result.values.severity})`);
+    await event.thread.post(`Bug filed: ${result.values.title} (${result.values.severity})`);
+    break;
+  }
 });
 ```
 
-Internally, when `errors` is set, the next `openModal` call uses `request.respondWith()` (from a `"use step"` function, per WDK requirements) to send a `response_action: "errors"` response back to the platform synchronously, then creates a new webhook and suspends again for the next submission. This leverages `createWebhook({ respondWith: "manual" })` so that each submission can receive a dynamic response before the workflow re-suspends.
+### Cancellation
 
-### Cancellation via Try/Catch
-
-When a user closes a modal (clicks Cancel or the X button), the webhook resolves with a `close` event. The `openModal` implementation throws a `ModalClosedError`:
+When a user closes a modal, the adapter POSTs a `{ type: "close" }` payload to the `callbackUrl`. In a workflow, you can handle this however you like:
 
 ```tsx
 bot.onAction("feedback", async (event) => {
   "use workflow";
 
-  try {
-    const result = await event.openModal(
-      <Modal title="Feedback" notifyOnClose>
-        <TextInput id="message" label="Message" />
-      </Modal>,
-    );
-    await event.thread.post(`Thanks for the feedback: ${result.values.message}`);
-  } catch (err) {
-    if (err instanceof ModalClosedError) {
-      console.log(`${err.user.userName} cancelled the feedback form`);
-      // Optionally notify the user
-    }
+  const hook = createHook<ModalResult | ModalCloseEvent>();
+
+  await event.openModal(
+    <Modal title="Feedback" callbackUrl={hook.url} notifyOnClose>
+      <TextInput id="message" label="Message" />
+    </Modal>,
+  );
+
+  const result = await hook;
+
+  if (result.type === "close") {
+    console.log(`${result.user.userName} cancelled the feedback form`);
+    return;
   }
+
+  await event.thread.post(`Thanks for the feedback: ${result.values.message}`);
 });
 ```
-
-This replaces `bot.onModalClose()` entirely for workflows. The error is caught in the same scope where the modal was opened, with full access to the surrounding closure.
 
 ### Timeout Pattern
 
@@ -279,14 +329,16 @@ Using Workflow DevKit's `sleep()` and `Promise.race`:
 bot.onAction("approval", async (event) => {
   "use workflow";
 
-  const modalPromise = event.openModal(
-    <Modal title="Approve Request" submitLabel="Approve">
+  const hook = createHook<ModalResult>();
+
+  await event.openModal(
+    <Modal title="Approve Request" submitLabel="Approve" callbackUrl={hook.url}>
       <TextInput id="reason" label="Reason" />
     </Modal>,
   );
 
   const result = await Promise.race([
-    modalPromise,
+    hook,
     sleep("1h").then(() => "timeout" as const),
   ]);
 
@@ -310,16 +362,19 @@ bot.onAction("onboarding", async (event) => {
   "use workflow";
 
   // Step 1: Basic info
-  const step1 = await event.openModal(
-    <Modal title="Step 1: Basic Info" submitLabel="Next">
+  const hook1 = createHook<ModalResult>();
+  await event.openModal(
+    <Modal title="Step 1: Basic Info" submitLabel="Next" callbackUrl={hook1.url}>
       <TextInput id="name" label="Full Name" />
       <TextInput id="email" label="Email" />
     </Modal>,
   );
+  const step1 = await hook1;
 
   // Step 2: Preferences (has access to step1 values in scope!)
-  const step2 = await event.openModal(
-    <Modal title={`Step 2: Preferences for ${step1.values.name}`} submitLabel="Next">
+  const hook2 = createHook<ModalResult>();
+  await event.openModal(
+    <Modal title={`Step 2: Preferences for ${step1.values.name}`} submitLabel="Next" callbackUrl={hook2.url}>
       <Select id="team" label="Team">
         <SelectOption label="Engineering" value="eng" />
         <SelectOption label="Design" value="design" />
@@ -332,17 +387,7 @@ bot.onAction("onboarding", async (event) => {
       </Select>
     </Modal>,
   );
-
-  // Step 3: Confirmation
-  const step3 = await event.openModal(
-    <Modal title="Confirm" submitLabel="Complete">
-      <TextInput
-        id="confirm"
-        label={`Confirm onboarding for ${step1.values.name} on ${step2.values.team}?`}
-        initialValue="yes"
-      />
-    </Modal>,
-  );
+  const step2 = await hook2;
 
   // All values available in one scope -- no privateMetadata gymnastics
   await event.thread.post(
@@ -351,46 +396,47 @@ bot.onAction("onboarding", async (event) => {
 });
 ```
 
-### Parallel Modal Collection
+### Without Workflow DevKit
 
-Using `Promise.all` with webhooks to collect responses from multiple users:
+The `callbackUrl` approach works with any HTTP server. You don't need Workflow DevKit at all:
 
-```tsx
-async function collectVotes(thread: Thread, voters: string[]) {
-  "use workflow";
+```ts
+// Express example -- no workflow, no compiler
+import express from "express";
 
-  const results = await Promise.all(
-    voters.map(async (userId) => {
-      const dmThread = await bot.openDM(userId);
-      await dmThread.post(
-        <Card title="Vote Required">
-          <Text>Please submit your vote.</Text>
-          <Actions>
-            <Button onAction={async (event) => {
-              "use workflow";
-              const result = await event.openModal(
-                <Modal title="Cast Your Vote">
-                  <Select id="vote" label="Your Vote">
-                    <SelectOption label="Approve" value="approve" />
-                    <SelectOption label="Reject" value="reject" />
-                    <SelectOption label="Abstain" value="abstain" />
-                  </Select>
-                  <TextInput id="reason" label="Reason (optional)" optional />
-                </Modal>,
-              );
-              return result.values;
-            }}>
-              Vote Now
-            </Button>
-          </Actions>
-        </Card>,
-      );
-    }),
+const app = express();
+const pendingModals = new Map<string, (data: any) => void>();
+
+app.post("/api/modal-callback/:id", express.json(), (req, res) => {
+  const resolve = pendingModals.get(req.params.id);
+  if (resolve) {
+    resolve(req.body);
+    pendingModals.delete(req.params.id);
+  }
+  res.sendStatus(200);
+});
+
+bot.onAction("feedback", async (event) => {
+  const callbackId = crypto.randomUUID();
+  const callbackUrl = `https://my-app.com/api/modal-callback/${callbackId}`;
+
+  // Create a promise that resolves when the callback fires
+  const resultPromise = new Promise<ModalResult>((resolve) => {
+    pendingModals.set(callbackId, resolve);
+  });
+
+  await event.openModal(
+    <Modal title="Feedback" callbackUrl={callbackUrl}>
+      <TextInput id="message" label="Message" />
+    </Modal>,
   );
 
-  return results;
-}
+  const result = await resultPromise;
+  await event.thread.post(`Feedback: ${result.values.message}`);
+});
 ```
+
+This is more boilerplate than the Workflow DevKit version, but it works in any environment without any special runtime. The key insight: **chat-sdk just needs to POST to a URL** -- what's on the other end is up to you.
 
 ## Implementation
 
@@ -398,46 +444,43 @@ async function collectVotes(thread: Thread, voters: string[]) {
 
 ```
                                     ┌──────────────────────────────────────┐
-                                    │           Workflow Runtime            │
+                                    │        Your App / Workflow           │
                                     │                                      │
-  User clicks                       │  bot.onAction("feedback", async () { │
-  [Feedback] button                 │    "use workflow";                    │
+  User clicks                       │  const hook = createHook()           │
+  [Feedback] button                 │  event.openModal(                    │
+       │                            │    <Modal callbackUrl={hook.url}>    │
+       ▼                            │  )                                   │
+  ┌─────────┐   processAction()     │                                      │
+  │ Platform ├─────────────────────►│  ──── workflow suspends ────         │
+  │ (Slack)  │                      │       (no compute)                   │
+  └─────────┘                       │                                      │
        │                            │                                      │
-       ▼                            │    // Step 1: open modal             │
-  ┌─────────┐   processAction()     │    const webhook = createWebhook()   │
-  │ Platform ├─────────────────────►│    adapter.openModal(triggerId,      │
-  │ (Slack)  │                      │      modal, webhook.url)             │
-  └─────────┘                       │                                      │
-       │                            │    ──── workflow suspends ────        │
-       │   User fills form          │         (no compute)                 │
+       │   User fills form          │                                      │
        │   and clicks Submit        │                                      │
-       ▼                            │    ──── webhook fires ────           │
-  ┌─────────┐  POST webhook.url     │                                      │
-  │ Platform ├─────────────────────►│    const result = await webhook      │
-  │ (Slack)  │                      │    // { values, user, viewId }       │
+       ▼                            │  ──── hook fires ────                │
+  ┌─────────┐                       │                                      │
+  │ Platform │──► chat-sdk ──► POST │  const result = await hook           │
+  │ (Slack)  │    callbackUrl       │  // { type, values, user, viewId }   │
   └─────────┘                       │                                      │
-                                    │    // Step 2: handle result          │
-                                    │    await thread.post(...)            │
-                                    │  });                                 │
+                                    │  await thread.post(...)              │
                                     └──────────────────────────────────────┘
 ```
 
 ### Key Implementation Details
 
-#### 1. Webhook-Based Resumption
+#### 1. `callbackUrl` Routing in Adapters
 
-The core mechanism uses `createWebhook()` from Workflow DevKit. When `openModal()` is called inside a `"use workflow"` function:
+When the adapter receives a modal submission/close event:
 
-1. A webhook is created via `createWebhook({ respondWith: "manual" })` -- `respondWith: "manual"` is needed so step functions can send dynamic HTTP responses (e.g., validation errors) back to the platform
-2. The webhook URL is passed to the adapter's `openModal()` method (new `webhookUrl` parameter)
-3. The adapter stores the webhook URL alongside the modal's platform-specific metadata
-4. When the platform sends a submission/close event, the adapter POSTs to the webhook URL instead of calling `processModalSubmit()`
-5. The workflow resumes -- `await webhook` resolves to a standard `Request` object (per WDK docs, `createWebhook` always resolves to `Request`, unlike `createHook<T>` which resolves to `T`)
-6. A step function parses the request via `request.json()` and optionally calls `request.respondWith()` for validation errors
+1. Check if the modal metadata contains a `callbackUrl`
+2. If yes: POST the event payload to `callbackUrl` and return (skip internal routing)
+3. If no: route through `processModalSubmit()` / `processModalClose()` as today
+
+This is the only change needed in the adapter layer.
 
 #### 2. Adapter Changes
 
-The `Adapter.openModal()` signature gains an optional `webhookUrl` parameter:
+The adapter reads `callbackUrl` from the `<Modal>` element during `openModal()` and stores it in the platform's metadata (e.g., Slack's `private_metadata`):
 
 ```ts
 interface Adapter {
@@ -445,22 +488,56 @@ interface Adapter {
     triggerId: string,
     modal: ModalElement,
     contextId?: string,
-    options?: { webhookUrl?: string },
+    options?: { callbackUrl?: string },
   ): Promise<{ viewId: string }>;
 }
 ```
 
-When `webhookUrl` is present, the adapter stores it in the modal metadata (e.g., Slack's `private_metadata`). On submission/close, if a webhook URL is found in the metadata, the adapter POSTs to it instead of calling `processModalSubmit()` / `processModalClose()`.
+When `callbackUrl` is present, the adapter stores it in the modal metadata. On submission/close, if a `callbackUrl` is found, the adapter POSTs to it instead of calling `processModalSubmit()` / `processModalClose()`.
 
-#### 3. Serialization
+Similarly for `<Button>`:
 
-chat-sdk already has full `@workflow/serde` integration:
+```ts
+interface ButtonElement {
+  id?: string;
+  callbackUrl?: string;
+  onAction?: ActionHandler;
+  children: string;
+}
+```
 
-- `ThreadImpl` has `WORKFLOW_SERIALIZE` and `WORKFLOW_DESERIALIZE` static methods
-- `Message` has the same
-- `chat.registerSingleton()` enables lazy adapter resolution after deserialization
+When a button with `callbackUrl` is clicked, the adapter POSTs the action event to that URL instead of routing through `processAction()`.
 
-The `ActionEvent` and `ModalResult` types will need similar serde support so they can cross the workflow suspension boundary.
+#### 3. Payload Format
+
+The adapter POSTs a standardized JSON payload to the `callbackUrl`:
+
+```ts
+// Modal submit
+interface ModalSubmitPayload {
+  type: "submit";
+  values: Record<string, string>;
+  user: Author;
+  viewId: string;
+  raw: unknown; // platform-specific raw payload
+}
+
+// Modal close
+interface ModalClosePayload {
+  type: "close";
+  user: Author;
+  viewId: string;
+}
+
+// Button action
+interface ActionPayload {
+  type: "action";
+  actionId: string;
+  user: Author;
+  triggerId: string;
+  raw: unknown;
+}
+```
 
 #### 4. `onAction` Prop Handler Registry
 
@@ -493,12 +570,12 @@ This is fully **additive**. All existing patterns continue to work:
 | `bot.onAction("id", handler)` | Works as-is |
 | `bot.onModalSubmit("callbackId", handler)` | Works as-is |
 | `bot.onModalClose("callbackId", handler)` | Works as-is |
-| `event.openModal()` (fire-and-forget) | Works as-is outside `"use workflow"` |
+| `event.openModal()` (fire-and-forget) | Works as-is (no `callbackUrl`) |
 | `privateMetadata` | Works as-is |
 | `<Button id="x">` | Works as-is |
 
 The new patterns are only active when:
-1. The handler function has a `"use workflow"` directive, **or**
+1. A `<Modal>` or `<Button>` has a `callbackUrl` prop, **or**
 2. A `<Button>` has an `onAction` prop
 
 ### Migration Path
@@ -513,60 +590,56 @@ bot.onAction("feedback", async (event) => {
 bot.onModalSubmit("feedback_form", async (event) => { ... });
 bot.onModalClose("feedback_form", async (event) => { ... });
 
-// After: single workflow function
+// After: single function with callbackUrl + workflow
 bot.onAction("feedback", async (event) => {
   "use workflow";
-  try {
-    const result = await event.openModal(<Modal ...> ... </Modal>);
+  const hook = createHook<ModalResult | ModalCloseEvent>();
+  await event.openModal(<Modal callbackUrl={hook.url} ...> ... </Modal>);
+  const result = await hook;
+  if (result.type === "submit") {
     await event.thread.post(`Feedback: ${result.values.message}`);
-  } catch (err) {
-    if (err instanceof ModalClosedError) { /* handle close */ }
   }
 });
 ```
 
-## Workflow DevKit Best Practices Alignment
+## Workflow DevKit Composition
 
-This section maps each proposed pattern to its corresponding WDK primitive and confirms alignment with the documented best practices.
+This section explains how `callbackUrl` composes with WDK primitives. The key insight: chat-sdk provides the plumbing (`callbackUrl`), WDK provides the durability (`createHook`).
 
-| RFC Pattern | WDK Primitive | Best Practice |
+| Pattern | WDK Primitive | How It Works |
 |---|---|---|
-| `openModal()` suspends workflow | `createWebhook()` + `await webhook` | Correct: webhooks suspend the workflow with zero compute. `await webhook` resolves to `Request`. |
-| Validation error responses | `respondWith: "manual"` + `request.respondWith()` in a step | Correct: per WDK docs, `respondWith()` must be called from a `"use step"` function. Manual mode enables dynamic responses. |
-| `sleep("1h")` for timeouts | `sleep()` from `"workflow"` | Correct: `sleep` accepts duration strings like `"1h"`, `"1d"`, `"10s"`. |
-| `Promise.race([modal, sleep])` | Native JS in workflow context | Correct: workflow functions support `Promise.race`, `Promise.all`, and other JS primitives for orchestration. |
-| Multi-step wizards (sequential `await`) | Sequential `createWebhook()` calls | Correct: each `await` is a separate suspension point. The event log replays prior steps on resume. |
-| Parallel vote collection (`Promise.all`) | Multiple concurrent webhooks | Correct: WDK supports multiple concurrent hooks/webhooks in a single workflow. |
-| `ModalClosedError` via try/catch | Standard error handling in workflows | Correct: workflow functions support try/catch. Errors propagate normally. |
-| Step functions for adapter calls | `"use step"` for Node.js work | Correct: workflow functions are sandboxed (no Node.js). All adapter calls, HTTP requests, and `respondWith()` calls must happen in step functions. |
-| Serialization across suspension | `@workflow/serde` (already integrated) | Correct: chat-sdk already has `WORKFLOW_SERIALIZE`/`WORKFLOW_DESERIALIZE` on `ThreadImpl` and `Message`. `ModalResult` and `ActionEvent` will need the same treatment. |
-| Deterministic replay | Workflow event log | Correct: step results are persisted. On replay, steps return cached results without re-executing. `openModal` as a step means the modal isn't re-opened on replay. |
+| Awaitable modal result | `createHook<T>()` | `hook.url` becomes the `callbackUrl`. `await hook` resolves to `T`. |
+| Awaitable button click | `createHook<T>()` | Same -- `hook.url` on `<Button callbackUrl>`. |
+| Timeout | `sleep()` + `Promise.race` | Race the hook against a sleep. |
+| Multi-step wizard | Sequential `createHook()` calls | Each modal gets its own hook. Values stay in scope. |
+| Parallel collection | `Promise.all` with multiple hooks | Multiple hooks, multiple modals, one `await`. |
+| Cancellation | Union type on hook | `createHook<ModalResult \| ModalCloseEvent>()`, check `result.type`. |
+| Durable across deploys | WDK event log | Hook URLs survive restarts. Workflow replays to the suspension point. |
 
-**Key WDK constraints respected:**
+**Key advantage over the previous `"use workflow"` approach:** chat-sdk doesn't need to know about Workflow DevKit at all. It just POSTs to a URL. This means:
 
-1. **`createWebhook()` has no generic type parameter** -- unlike `createHook<T>()`, webhooks always resolve to `Request`. Type safety for modal values is layered on top by the `openModal()` implementation.
-2. **`respondWith()` must be called from a step function** -- this is a current WDK limitation (may be relaxed in the future). The validation loop pattern accounts for this.
-3. **Pass-by-value semantics** -- step function parameters are serialized. The `openModal` step receives the serialized modal element and adapter reference, not live objects. The `chat.registerSingleton()` pattern already handles lazy adapter resolution after deserialization.
-4. **Determinism in workflow functions** -- no `Math.random`, `Date.now()`, or non-deterministic calls directly in workflow functions. All such logic lives in step functions.
-5. **`sleep()` is a special step** -- called directly in workflow functions, not inside step functions.
+1. **No custom compiler** -- `callbackUrl` is just a string prop.
+2. **Works in Express, Fastify, Hono, etc.** -- point `callbackUrl` at any HTTP endpoint.
+3. **Composable** -- WDK users get awaitable modals via `createHook`. Non-WDK users can use any callback mechanism.
+4. **Simple internals** -- chat-sdk's only job is to POST to the URL. No workflow runtime, no step functions, no serde integration needed for this feature.
 
 ## Open Questions
 
-1. **Handler registry persistence** -- Should inline `onAction` handlers be persisted to the state adapter so they survive deployments? Or are they ephemeral (scoped to the process lifetime)?
+1. **Payload signing** -- Should the adapter sign the `callbackUrl` POST payload (e.g., HMAC) so the receiver can verify it came from chat-sdk? This would prevent spoofing.
 
-2. **Validation response latency** -- The proposed approach uses `createWebhook({ respondWith: "manual" })` and calls `request.respondWith()` from a step function to send validation errors synchronously. However, the workflow must resume, run the validation step, and call `respondWith()` all within the platform's response timeout (Slack allows ~3 seconds for `view_submission`). Is the WDK resume-to-step-execution latency low enough, or do we need an optimistic path where the adapter holds the HTTP response open while the workflow resumes?
+2. **Platform constraints** -- Slack's trigger IDs expire in 3 seconds. In a multi-step wizard, the second `openModal()` call needs a fresh trigger ID. This may require the submission response to include a new trigger ID, or the adapter to use Slack's `response_action: "push"` to chain views.
 
-3. **Platform constraints** -- Slack's trigger IDs expire in 3 seconds. In a multi-step wizard, the second `openModal()` call needs a fresh trigger ID. This may require the submission webhook response to include a new trigger ID, or the adapter to use Slack's `response_action: "push"` to chain views.
+3. **Validation response synchronicity** -- For Slack's `response_action: "errors"` pattern, the validation errors must be returned in the synchronous HTTP response to the `view_submission` event. When using `callbackUrl`, should the adapter hold the response open until the `callbackUrl` endpoint responds (allowing it to return errors)? Or should validation be handled differently?
 
-4. **Non-workflow usage** -- Should `openModal()` always return `Promise<ModalResult>` even outside `"use workflow"`, making the webhook handling transparent? Or should it only change behavior inside workflows?
+4. **Handler cleanup** -- For inline `onAction`, when should the handler be garbage collected? Options: (a) after first invocation, (b) after a TTL, (c) when the message is deleted, (d) never (let the state adapter TTL handle it).
 
-5. **Handler cleanup** -- For inline `onAction`, when should the handler be garbage collected? Options: (a) after first invocation, (b) after a TTL, (c) when the message is deleted, (d) never (let the state adapter TTL handle it).
+5. **`callbackUrl` on other interactive elements** -- Should `callbackUrl` extend to `<Select>`, `<Overflow>`, and other interactive components, or just `<Modal>` and `<Button>` for now?
 
 ## References
 
-- [Workflow DevKit -- Workflows and Steps](https://useworkflow.dev/docs/foundations/workflows-and-steps)
-- [Workflow DevKit -- Common Patterns (webhooks, sleep, Promise.race)](https://useworkflow.dev/docs/foundations/common-patterns)
 - [Workflow DevKit -- Hooks & Webhooks](https://useworkflow.dev/docs/foundations/hooks-and-webhooks)
+- [Workflow DevKit -- Workflows and Steps](https://useworkflow.dev/docs/foundations/workflows-and-steps)
+- [Workflow DevKit -- Common Patterns (sleep, Promise.race)](https://useworkflow.dev/docs/foundations/common-patterns)
 - [Workflow DevKit -- Human-in-the-Loop](https://useworkflow.dev/docs/ai-agents/human-in-the-loop)
 - [`packages/chat/src/chat.ts`](../packages/chat/src/chat.ts) -- Current `onAction` / `onModalSubmit` / `onModalClose` pattern
 - [`packages/chat/src/types.ts`](../packages/chat/src/types.ts) -- `ActionEvent`, `ModalSubmitEvent`, `ModalCloseEvent` types
