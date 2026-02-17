@@ -11,17 +11,21 @@ import type {
   Adapter,
   AdapterPostableMessage,
   Attachment,
+  ChannelInfo,
   ChatInstance,
   EmojiValue,
   EphemeralMessage,
   FetchOptions,
   FetchResult,
   FormattedContent,
+  ListThreadsOptions,
+  ListThreadsResult,
   Logger,
   RawMessage,
   ReactionEvent,
   StateAdapter,
   ThreadInfo,
+  ThreadSummary,
   WebhookOptions,
 } from "chat";
 import { convertEmojiPlaceholders, defaultEmojiResolver, Message } from "chat";
@@ -1895,6 +1899,339 @@ export class GoogleChatAdapter implements Adapter<GoogleChatThreadId, unknown> {
       };
     } catch (error) {
       this.handleGoogleChatError(error, "fetchThread");
+    }
+  }
+
+  /**
+   * Derive channel ID from a Google Chat thread ID.
+   * gchat:{spaceName}:{encodedThreadName} -> gchat:{spaceName}
+   */
+  channelIdFromThreadId(threadId: string): string {
+    const { spaceName } = this.decodeThreadId(threadId);
+    return `gchat:${spaceName}`;
+  }
+
+  /**
+   * Fetch channel-level messages (all messages in a space, not filtered by thread).
+   */
+  async fetchChannelMessages(
+    channelId: string,
+    options: FetchOptions = {},
+  ): Promise<FetchResult<unknown>> {
+    // Channel ID format: "gchat:spaces/ABC123"
+    const spaceName = channelId.split(":").slice(1).join(":");
+    if (!spaceName) {
+      throw new ValidationError(
+        "gchat",
+        `Invalid Google Chat channel ID: ${channelId}`,
+      );
+    }
+
+    const api = this.impersonatedChatApi || this.chatApi;
+    const direction = options.direction ?? "backward";
+    const limit = options.limit || 100;
+
+    try {
+      if (direction === "backward") {
+        this.logger.debug(
+          "GChat API: spaces.messages.list (channel, backward)",
+          {
+            spaceName,
+            pageSize: limit,
+            cursor: options.cursor,
+          },
+        );
+
+        const response = await api.spaces.messages.list({
+          parent: spaceName,
+          pageSize: limit,
+          pageToken: options.cursor,
+          orderBy: "createTime desc",
+        });
+
+        // Reverse to chronological order within page
+        const rawMessages = (response.data.messages || []).reverse();
+
+        const messages = await Promise.all(
+          rawMessages.map((msg) =>
+            this.parseGChatListMessage(msg, spaceName, channelId),
+          ),
+        );
+
+        return {
+          messages,
+          nextCursor: response.data.nextPageToken ?? undefined,
+        };
+      }
+
+      // Forward direction
+      this.logger.debug("GChat API: spaces.messages.list (channel, forward)", {
+        spaceName,
+        limit,
+        cursor: options.cursor,
+      });
+
+      const allRawMessages: chat_v1.Schema$Message[] = [];
+      let pageToken: string | undefined;
+
+      do {
+        const response = await api.spaces.messages.list({
+          parent: spaceName,
+          pageSize: 1000,
+          pageToken,
+        });
+        allRawMessages.push(...(response.data.messages || []));
+        pageToken = response.data.nextPageToken ?? undefined;
+      } while (pageToken);
+
+      let startIndex = 0;
+      if (options.cursor) {
+        const cursorIndex = allRawMessages.findIndex(
+          (msg) => msg.name === options.cursor,
+        );
+        if (cursorIndex >= 0) startIndex = cursorIndex + 1;
+      }
+
+      const selectedMessages = allRawMessages.slice(
+        startIndex,
+        startIndex + limit,
+      );
+
+      const messages = await Promise.all(
+        selectedMessages.map((msg) =>
+          this.parseGChatListMessage(msg, spaceName, channelId),
+        ),
+      );
+
+      let nextCursor: string | undefined;
+      if (
+        startIndex + limit < allRawMessages.length &&
+        selectedMessages.length > 0
+      ) {
+        const lastMsg = selectedMessages[selectedMessages.length - 1];
+        if (lastMsg?.name) nextCursor = lastMsg.name;
+      }
+
+      return { messages, nextCursor };
+    } catch (error) {
+      this.handleGoogleChatError(error, "fetchChannelMessages");
+    }
+  }
+
+  /**
+   * List threads in a Google Chat space.
+   * Fetches messages and deduplicates by thread name.
+   */
+  async listThreads(
+    channelId: string,
+    options: ListThreadsOptions = {},
+  ): Promise<ListThreadsResult<unknown>> {
+    const spaceName = channelId.split(":").slice(1).join(":");
+    if (!spaceName) {
+      throw new ValidationError(
+        "gchat",
+        `Invalid Google Chat channel ID: ${channelId}`,
+      );
+    }
+
+    const api = this.impersonatedChatApi || this.chatApi;
+    const limit = options.limit || 50;
+
+    try {
+      this.logger.debug("GChat API: spaces.messages.list (listThreads)", {
+        spaceName,
+        limit,
+        cursor: options.cursor,
+      });
+
+      // Fetch recent messages ordered by createTime desc
+      const response = await api.spaces.messages.list({
+        parent: spaceName,
+        pageSize: Math.min(limit * 3, 1000), // Fetch more to account for dedup
+        pageToken: options.cursor,
+        orderBy: "createTime desc",
+      });
+
+      const rawMessages = response.data.messages || [];
+
+      // Group by thread name, keeping the first (most recent) message per thread
+      const threadMap = new Map<
+        string,
+        { rootMsg: chat_v1.Schema$Message; count: number }
+      >();
+      for (const msg of rawMessages) {
+        const threadName = msg.thread?.name;
+        if (!threadName) continue;
+        const existing = threadMap.get(threadName);
+        if (existing) {
+          existing.count++;
+        } else {
+          threadMap.set(threadName, { rootMsg: msg, count: 1 });
+        }
+      }
+
+      // Convert to ThreadSummary (limited)
+      const threads: ThreadSummary[] = [];
+      let count = 0;
+      for (const [threadName, { rootMsg, count: replyCount }] of threadMap) {
+        if (count >= limit) break;
+
+        const threadId = this.encodeThreadId({
+          spaceName,
+          threadName,
+        });
+
+        const message = await this.parseGChatListMessage(
+          rootMsg,
+          spaceName,
+          threadId,
+        );
+
+        threads.push({
+          id: threadId,
+          rootMessage: message,
+          replyCount,
+          lastReplyAt: rootMsg.createTime
+            ? new Date(rootMsg.createTime)
+            : undefined,
+        });
+        count++;
+      }
+
+      this.logger.debug("GChat API: listThreads result", {
+        threadCount: threads.length,
+      });
+
+      return {
+        threads,
+        nextCursor: response.data.nextPageToken ?? undefined,
+      };
+    } catch (error) {
+      this.handleGoogleChatError(error, "listThreads");
+    }
+  }
+
+  /**
+   * Fetch Google Chat space info/metadata.
+   */
+  async fetchChannelInfo(channelId: string): Promise<ChannelInfo> {
+    const spaceName = channelId.split(":").slice(1).join(":");
+    if (!spaceName) {
+      throw new ValidationError(
+        "gchat",
+        `Invalid Google Chat channel ID: ${channelId}`,
+      );
+    }
+
+    try {
+      this.logger.debug("GChat API: spaces.get (channelInfo)", { spaceName });
+
+      const response = await this.chatApi.spaces.get({ name: spaceName });
+      const space = response.data;
+
+      // Try to get member count
+      let memberCount: number | undefined;
+      try {
+        const membersResponse = await this.chatApi.spaces.members.list({
+          parent: spaceName,
+          pageSize: 1,
+        });
+        // The API doesn't return total count directly, but we can check if there are members
+        if (membersResponse.data.memberships) {
+          memberCount = membersResponse.data.memberships.length;
+        }
+      } catch {
+        // Member list may not be accessible
+      }
+
+      return {
+        id: channelId,
+        name: space.displayName ?? undefined,
+        isDM:
+          space.spaceType === "DIRECT_MESSAGE" ||
+          space.singleUserBotDm === true,
+        memberCount,
+        metadata: {
+          spaceType: space.spaceType,
+          spaceThreadingState: space.spaceThreadingState,
+          raw: space,
+        },
+      };
+    } catch (error) {
+      this.handleGoogleChatError(error, "fetchChannelInfo");
+    }
+  }
+
+  /**
+   * Post a message to a space top-level (starts a new conversation, not in a thread).
+   */
+  async postChannelMessage(
+    channelId: string,
+    message: AdapterPostableMessage,
+  ): Promise<RawMessage<unknown>> {
+    const spaceName = channelId.split(":").slice(1).join(":");
+    if (!spaceName) {
+      throw new ValidationError(
+        "gchat",
+        `Invalid Google Chat channel ID: ${channelId}`,
+      );
+    }
+
+    try {
+      const card = extractCard(message);
+
+      if (card) {
+        const cardId = `card-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+        const googleCard = cardToGoogleCard(card, {
+          cardId,
+          endpointUrl: this.endpointUrl,
+        });
+
+        this.logger.debug("GChat API: spaces.messages.create (channel, card)", {
+          spaceName,
+        });
+
+        const response = await this.chatApi.spaces.messages.create({
+          parent: spaceName,
+          requestBody: {
+            cardsV2: [googleCard],
+            // No thread field - creates a new conversation
+          },
+        });
+
+        return {
+          id: response.data.name || "",
+          threadId: channelId,
+          raw: response.data,
+        };
+      }
+
+      // Regular text message
+      const text = convertEmojiPlaceholders(
+        this.formatConverter.renderPostable(message),
+        "gchat",
+      );
+
+      this.logger.debug("GChat API: spaces.messages.create (channel)", {
+        spaceName,
+        textLength: text.length,
+      });
+
+      const response = await this.chatApi.spaces.messages.create({
+        parent: spaceName,
+        requestBody: {
+          text,
+          // No thread field - creates a new conversation
+        },
+      });
+
+      return {
+        id: response.data.name || "",
+        threadId: channelId,
+        raw: response.data,
+      };
+    } catch (error) {
+      this.handleGoogleChatError(error, "postChannelMessage");
     }
   }
 
