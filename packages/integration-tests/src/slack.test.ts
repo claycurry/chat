@@ -453,6 +453,53 @@ describe("Slack Integration", () => {
         expect.objectContaining({ text: "Done typing!" })
       );
     });
+
+    it("should render plan/task blocks and update in-place", async () => {
+      chat.onNewMention(async (thread) => {
+        const plan = await thread.postPlan({ initialMessage: "Working..." });
+        await plan.addTask({
+          title: "Fetch data",
+          children: ["Call API"],
+        });
+        await plan.updateTask("Received response");
+        await plan.complete({ completeMessage: "Done" });
+      });
+
+      const event = createSlackEvent({
+        type: "app_mention",
+        text: `@${SLACK_BOT_USERNAME} plan test`,
+        userId: "U_USER_123",
+        messageTs: "1234567890.111111",
+        threadTs: TEST_THREAD_TS,
+        channel: TEST_CHANNEL,
+      });
+
+      await chat.webhooks.slack(createSlackWebhookRequest(event), {
+        waitUntil: tracker.waitUntil,
+      });
+      await tracker.waitForAll();
+
+      expect(mockClient.chat.postMessage).toHaveBeenCalledWith(
+        expect.objectContaining({
+          blocks: [
+            expect.objectContaining({
+              type: "plan",
+              title: "Working...",
+            }),
+          ],
+        })
+      );
+      expect(mockClient.chat.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          blocks: [
+            expect.objectContaining({
+              type: "plan",
+              title: "Done",
+            }),
+          ],
+        })
+      );
+    });
   });
 
   describe("multi-message conversation flow", () => {

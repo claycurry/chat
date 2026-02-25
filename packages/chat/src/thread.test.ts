@@ -842,4 +842,236 @@ describe("ThreadImpl", () => {
     // Note: Streaming is prevented at the type level - postEphemeral accepts
     // AdapterPostableMessage | CardJSXElement which excludes AsyncIterable<string>
   });
+
+  describe("postPlan", () => {
+    let thread: ThreadImpl;
+    let mockAdapter: Adapter;
+    let mockState: ReturnType<typeof createMockState>;
+
+    beforeEach(() => {
+      mockAdapter = createMockAdapter();
+      mockState = createMockState();
+
+      thread = new ThreadImpl({
+        id: "slack:C123:1234.5678",
+        adapter: mockAdapter,
+        channelId: "C123",
+        stateAdapter: mockState,
+      });
+    });
+
+    it("should return no-op PlanMessage when adapter does not support plans", async () => {
+      // Adapter has no postPlan/editPlan methods by default
+      const plan = await thread.postPlan({ initialMessage: "Starting..." });
+
+      // Should still return a PlanMessage with inspectors working
+      expect(plan.title()).toBe("Starting...");
+      expect(plan.tasks()).toHaveLength(1);
+      expect(plan.tasks()[0].status).toBe("in_progress");
+
+      // Methods should return null (no-op)
+      const task = await plan.addTask({ title: "Task 1" });
+      expect(task).toBeNull();
+
+      const updated = await plan.updateTask("progress");
+      expect(updated).toBeNull();
+
+      const reset = await plan.reset({ initialMessage: "Reset" });
+      expect(reset).toBeNull();
+
+      // complete should not throw
+      await plan.complete({ completeMessage: "Done" });
+    });
+
+    it("should call adapter postPlan when supported", async () => {
+      const mockPostPlan = vi.fn().mockResolvedValue({
+        id: "plan-msg-1",
+        threadId: "slack:C123:1234.5678",
+      });
+      const mockEditPlan = vi.fn().mockResolvedValue(undefined);
+      mockAdapter.postPlan = mockPostPlan;
+      mockAdapter.editPlan = mockEditPlan;
+
+      const plan = await thread.postPlan({ initialMessage: "Working..." });
+
+      expect(mockPostPlan).toHaveBeenCalledWith(
+        "slack:C123:1234.5678",
+        expect.objectContaining({
+          title: "Working...",
+          tasks: expect.arrayContaining([
+            expect.objectContaining({
+              title: "Working...",
+              status: "in_progress",
+            }),
+          ]),
+        })
+      );
+      expect(plan.id).toBe("plan-msg-1");
+    });
+
+    it("should add tasks and call editPlan", async () => {
+      const mockPostPlan = vi.fn().mockResolvedValue({
+        id: "plan-msg-1",
+        threadId: "slack:C123:1234.5678",
+      });
+      const mockEditPlan = vi.fn().mockResolvedValue(undefined);
+      mockAdapter.postPlan = mockPostPlan;
+      mockAdapter.editPlan = mockEditPlan;
+
+      const plan = await thread.postPlan({ initialMessage: "Starting" });
+      const task = await plan.addTask({
+        title: "Fetch data",
+        children: ["Call API", "Parse response"],
+      });
+
+      expect(task).not.toBeNull();
+      expect(task?.title).toBe("Fetch data");
+      expect(task?.status).toBe("in_progress");
+      expect(mockEditPlan).toHaveBeenCalled();
+
+      // Plan title should be updated to current task
+      expect(plan.title()).toBe("Fetch data");
+      expect(plan.tasks()).toHaveLength(2);
+    });
+
+    it("should update current task with output", async () => {
+      const mockPostPlan = vi.fn().mockResolvedValue({
+        id: "plan-msg-1",
+        threadId: "slack:C123:1234.5678",
+      });
+      const mockEditPlan = vi.fn().mockResolvedValue(undefined);
+      mockAdapter.postPlan = mockPostPlan;
+      mockAdapter.editPlan = mockEditPlan;
+
+      const plan = await thread.postPlan({ initialMessage: "Working" });
+      await plan.addTask({ title: "Step 1" });
+      const updated = await plan.updateTask("Got result: 42");
+
+      expect(updated).not.toBeNull();
+      expect(mockEditPlan).toHaveBeenCalled();
+    });
+
+    it("should complete plan and mark tasks done", async () => {
+      const mockPostPlan = vi.fn().mockResolvedValue({
+        id: "plan-msg-1",
+        threadId: "slack:C123:1234.5678",
+      });
+      const mockEditPlan = vi.fn().mockResolvedValue(undefined);
+      mockAdapter.postPlan = mockPostPlan;
+      mockAdapter.editPlan = mockEditPlan;
+
+      const plan = await thread.postPlan({ initialMessage: "Starting" });
+      await plan.addTask({ title: "Task 1" });
+      await plan.complete({ completeMessage: "All done!" });
+
+      expect(plan.title()).toBe("All done!");
+      // All tasks should be completed
+      for (const task of plan.tasks()) {
+        expect(task.status).toBe("complete");
+      }
+    });
+
+    it("should reset plan and start fresh", async () => {
+      const mockPostPlan = vi.fn().mockResolvedValue({
+        id: "plan-msg-1",
+        threadId: "slack:C123:1234.5678",
+      });
+      const mockEditPlan = vi.fn().mockResolvedValue(undefined);
+      mockAdapter.postPlan = mockPostPlan;
+      mockAdapter.editPlan = mockEditPlan;
+
+      const plan = await thread.postPlan({ initialMessage: "First run" });
+      await plan.addTask({ title: "Task A" });
+      await plan.addTask({ title: "Task B" });
+
+      expect(plan.tasks()).toHaveLength(3);
+
+      const newTask = await plan.reset({ initialMessage: "Second run" });
+      expect(newTask).not.toBeNull();
+      expect(plan.title()).toBe("Second run");
+      expect(plan.tasks()).toHaveLength(1);
+      expect(plan.tasks()[0].status).toBe("in_progress");
+    });
+
+    it("should return currentTask correctly", async () => {
+      const mockPostPlan = vi.fn().mockResolvedValue({
+        id: "plan-msg-1",
+        threadId: "slack:C123:1234.5678",
+      });
+      const mockEditPlan = vi.fn().mockResolvedValue(undefined);
+      mockAdapter.postPlan = mockPostPlan;
+      mockAdapter.editPlan = mockEditPlan;
+
+      const plan = await thread.postPlan({ initialMessage: "Start" });
+
+      // Initially, current task is the first one
+      let current = plan.currentTask();
+      expect(current?.title).toBe("Start");
+      expect(current?.status).toBe("in_progress");
+
+      // After adding a new task, current should be the new one
+      await plan.addTask({ title: "Step 2" });
+      current = plan.currentTask();
+      expect(current?.title).toBe("Step 2");
+      expect(current?.status).toBe("in_progress");
+
+      // After completion, currentTask returns the last task
+      await plan.complete({ completeMessage: "Done" });
+      current = plan.currentTask();
+      expect(current?.title).toBe("Step 2");
+      expect(current?.status).toBe("complete");
+    });
+
+    it("should handle various PlanContent formats in initialMessage", async () => {
+      const mockPostPlan = vi.fn().mockResolvedValue({
+        id: "plan-msg-1",
+        threadId: "slack:C123:1234.5678",
+      });
+      const mockEditPlan = vi.fn().mockResolvedValue(undefined);
+      mockAdapter.postPlan = mockPostPlan;
+      mockAdapter.editPlan = mockEditPlan;
+
+      // String
+      let plan = await thread.postPlan({ initialMessage: "Simple string" });
+      expect(plan.title()).toBe("Simple string");
+
+      // Array of strings
+      plan = await thread.postPlan({ initialMessage: ["Line 1", "Line 2"] });
+      expect(plan.title()).toBe("Line 1 Line 2");
+
+      // Empty string defaults to "Plan"
+      plan = await thread.postPlan({ initialMessage: "" });
+      expect(plan.title()).toBe("Plan");
+    });
+
+    it("should ensure sequential edits via queue", async () => {
+      const editOrder: number[] = [];
+      let editCount = 0;
+
+      const mockPostPlan = vi.fn().mockResolvedValue({
+        id: "plan-msg-1",
+        threadId: "slack:C123:1234.5678",
+      });
+      const mockEditPlan = vi.fn().mockImplementation(async () => {
+        const myOrder = ++editCount;
+        // Simulate varying async delays
+        await new Promise((r) => setTimeout(r, Math.random() * 10));
+        editOrder.push(myOrder);
+      });
+      mockAdapter.postPlan = mockPostPlan;
+      mockAdapter.editPlan = mockEditPlan;
+
+      const plan = await thread.postPlan({ initialMessage: "Start" });
+
+      // Fire off multiple updates concurrently
+      await Promise.all([
+        plan.addTask({ title: "Task 1" }),
+        plan.updateTask("Output 1"),
+        plan.addTask({ title: "Task 2" }),
+      ]);
+
+      // Despite random delays, edits should complete in order
+      expect(editOrder).toEqual([1, 2, 3]);
+    });
+  });
 });

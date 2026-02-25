@@ -117,6 +117,16 @@ export interface Adapter<TThreadId = unknown, TRawMessage = unknown> {
     message: AdapterPostableMessage
   ): Promise<RawMessage<TRawMessage>>;
 
+  /**
+   * Optional: edit a previously posted plan message.
+   * If not implemented, plan helpers will no-op.
+   */
+  editPlan?(
+    threadId: string,
+    messageId: string,
+    plan: PlanModel
+  ): Promise<RawMessage<TRawMessage>>;
+
   /** Encode platform-specific data into a thread ID string */
   encodeThreadId(platformData: TThreadId): string;
 
@@ -278,6 +288,15 @@ export interface Adapter<TThreadId = unknown, TRawMessage = unknown> {
   postMessage(
     threadId: string,
     message: AdapterPostableMessage
+  ): Promise<RawMessage<TRawMessage>>;
+
+  /**
+   * Optional: post a plan/tasks surface as a single message.
+   * If not implemented, plan helpers will no-op.
+   */
+  postPlan?(
+    threadId: string,
+    plan: PlanModel
   ): Promise<RawMessage<TRawMessage>>;
 
   /** Remove a reaction from a message */
@@ -755,6 +774,14 @@ export interface Thread<TState = Record<string, unknown>, TRawMessage = unknown>
     options: PostEphemeralOptions
   ): Promise<EphemeralMessage | null>;
 
+  /**
+   * Post a new plan message in this thread.
+   *
+   * Platforms that don't support native plan surfaces will return a PlanMessage
+   * that no-ops (v1 behavior).
+   */
+  postPlan(options: StartPlanOptions): Promise<PlanMessage>;
+
   /** Recently fetched messages (cached) */
   recentMessages: Message<TRawMessage>[];
 
@@ -795,6 +822,81 @@ export interface Thread<TState = Record<string, unknown>, TRawMessage = unknown>
    * Future messages will no longer trigger `onSubscribedMessage` handlers.
    */
   unsubscribe(): Promise<void>;
+}
+
+export type PlanTaskStatus = "pending" | "in_progress" | "complete" | "error";
+
+export interface PlanTask {
+  id: string;
+  status: PlanTaskStatus;
+  title: string;
+}
+
+export interface PlanMessage {
+  /** Add a task and set it in progress. */
+  addTask(options: AddTaskOptions): Promise<PlanTask | null>;
+  /** Complete the plan and mark the current task complete. */
+  complete(options: CompletePlanOptions): Promise<void>;
+  /** Returns the in-progress task, or the last task if none is in-progress. */
+  currentTask(): PlanTask | null;
+  /** The underlying message ID on the platform (or a synthetic ID if unsupported). */
+  id: string;
+
+  /** Reset the plan contents and overwrite the same message. */
+  reset(options: StartPlanOptions): Promise<PlanTask | null>;
+  /** All tasks. */
+  tasks(): PlanTask[];
+  /** Thread ID where the plan was posted. */
+  threadId: string;
+
+  /** Current plan title. */
+  title(): string;
+  /** Update the current task (typically output). */
+  updateTask(update?: UpdateTaskInput): Promise<PlanTask | null>;
+}
+
+export interface PlanModel {
+  tasks: PlanModelTask[];
+  title: string;
+}
+
+export interface PlanModelTask {
+  details?: PlanContent;
+  id: string;
+  output?: PlanContent;
+  status: PlanTaskStatus;
+  title: string;
+}
+
+export type PlanContent =
+  | string
+  | string[]
+  | { markdown: string }
+  | { ast: Root };
+
+export interface StartPlanOptions {
+  /** Initial plan title and first task title */
+  initialMessage: PlanContent;
+}
+
+export interface AddTaskOptions {
+  /** Task details/substeps. */
+  children?: PlanContent;
+  title: PlanContent;
+}
+
+export type UpdateTaskInput =
+  | PlanContent
+  | {
+      /** Task output/results. */
+      output?: PlanContent;
+      /** Optional status override. */
+      status?: PlanTaskStatus;
+    };
+
+export interface CompletePlanOptions {
+  /** Final plan title shown when completed */
+  completeMessage: PlanContent;
 }
 
 export interface ThreadInfo {
