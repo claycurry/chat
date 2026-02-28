@@ -53,6 +53,57 @@ curl -X POST "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/setWebhook" \
   }'
 ```
 
+## Polling (no public webhook)
+
+Telegram also supports long polling via `getUpdates`.
+Polling starts automatically when `polling` is provided. Use `polling: true` for defaults:
+
+```typescript title="lib/bot.ts" lineNumbers
+import { Chat } from "chat";
+import { createTelegramAdapter } from "@chat-adapter/telegram";
+import { createMemoryState } from "@chat-adapter/state-memory";
+
+const telegram = createTelegramAdapter({
+  mode: "polling",
+  polling: {
+    timeout: 30,
+    dropPendingUpdates: false,
+  },
+});
+
+const bot = new Chat({
+  userName: "mybot",
+  adapters: { telegram },
+  state: createMemoryState(),
+});
+
+// Optional manual lifecycle control:
+// await telegram.startPolling();
+// await telegram.stopPolling();
+```
+
+### Auto mode: local polling, production webhooks
+
+```typescript title="lib/bot.ts" lineNumbers
+import { Chat } from "chat";
+import { createTelegramAdapter } from "@chat-adapter/telegram";
+import { createMemoryState } from "@chat-adapter/state-memory";
+
+const telegram = createTelegramAdapter({
+  mode: "auto", // default
+  polling: { timeout: 30 }, // only used when auto mode picks polling
+});
+
+export const bot = new Chat({
+  userName: "mybot",
+  adapters: { telegram },
+  state: createMemoryState(),
+});
+
+// Required for long-running local processes without incoming webhooks:
+void bot.initialize();
+```
+
 ## Configuration
 
 All options are auto-detected from environment variables when not provided.
@@ -61,6 +112,8 @@ All options are auto-detected from environment variables when not provided.
 |--------|----------|-------------|
 | `botToken` | No* | Telegram bot token. Auto-detected from `TELEGRAM_BOT_TOKEN` |
 | `secretToken` | No | Optional webhook secret token. Auto-detected from `TELEGRAM_WEBHOOK_SECRET_TOKEN` |
+| `mode` | No | Adapter mode: `auto` (default), `webhook`, or `polling` |
+| `polling` | No | Optional polling mode for `getUpdates` (`true` or config: `timeout`, `limit`, `allowedUpdates`, `deleteWebhook`, `dropPendingUpdates`, `retryDelayMs`) |
 | `userName` | No | Bot username used for mention detection. Auto-detected from `TELEGRAM_BOT_USERNAME` or `getMe` |
 | `apiBaseUrl` | No | Telegram API base URL. Auto-detected from `TELEGRAM_API_BASE_URL` |
 | `logger` | No | Logger instance (defaults to `ConsoleLogger("info")`) |
@@ -96,6 +149,9 @@ TELEGRAM_API_BASE_URL=https://api.telegram.org
 
 - Telegram does not expose full historical message APIs to bots. `fetchMessages` / `fetchChannelMessages` return adapter-cached messages from the current process.
 - `listThreads` is not available for Telegram chats.
+- Polling and webhooks are mutually exclusive in Telegram.
+- `mode: "polling"` deletes webhook by default before calling `getUpdates`.
+- `mode: "auto"` checks `getWebhookInfo`: if a webhook URL exists it uses webhook mode; otherwise it falls back to polling on non-serverless runtimes without deleting webhook.
 - `Button` and `LinkButton` in card `Actions` render as inline keyboard buttons.
 - Telegram callback data is limited to 64 bytes. Keep button `id`/`value` payloads short.
 - Other rich card elements (images/select menus/radios) render as fallback text only.

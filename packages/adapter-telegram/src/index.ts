@@ -40,6 +40,7 @@ import {
 import { TelegramFormatConverter } from "./markdown";
 import type {
   TelegramAdapterConfig,
+  TelegramAdapterMode,
   TelegramApiResponse,
   TelegramCallbackQuery,
   TelegramChat,
@@ -48,11 +49,13 @@ import type {
   TelegramMessage,
   TelegramMessageEntity,
   TelegramMessageReactionUpdated,
+  TelegramPollingConfig,
   TelegramRawMessage,
   TelegramReactionType,
   TelegramThreadId,
   TelegramUpdate,
   TelegramUser,
+  TelegramWebhookInfo,
 } from "./types";
 
 const TELEGRAM_API_BASE = "https://api.telegram.org";
@@ -66,6 +69,13 @@ const MESSAGE_SEQUENCE_PATTERN = /:(\d+)$/;
 const LEADING_AT_PATTERN = /^@+/;
 const EMOJI_PLACEHOLDER_PATTERN = /^\{\{emoji:([a-z0-9_]+)\}\}$/i;
 const EMOJI_NAME_PATTERN = /^[a-z0-9_+-]+$/i;
+const TELEGRAM_DEFAULT_POLLING_TIMEOUT_SECONDS = 30;
+const TELEGRAM_DEFAULT_POLLING_LIMIT = 100;
+const TELEGRAM_DEFAULT_POLLING_RETRY_DELAY_MS = 1000;
+const TELEGRAM_MAX_POLLING_LIMIT = 100;
+const TELEGRAM_MIN_POLLING_LIMIT = 1;
+const TELEGRAM_MIN_POLLING_TIMEOUT_SECONDS = 0;
+const TELEGRAM_MAX_POLLING_TIMEOUT_SECONDS = 300;
 interface TelegramMessageAuthor {
   fullName: string;
   isBot: boolean | "unknown";
@@ -73,6 +83,17 @@ interface TelegramMessageAuthor {
   userId: string;
   userName: string;
 }
+
+interface ResolvedTelegramPollingConfig {
+  allowedUpdates?: string[];
+  deleteWebhook: boolean;
+  dropPendingUpdates: boolean;
+  limit: number;
+  retryDelayMs: number;
+  timeoutSeconds: number;
+}
+
+type TelegramRuntimeMode = "webhook" | "polling";
 
 export class TelegramAdapter
   implements Adapter<TelegramThreadId, TelegramRawMessage>
@@ -93,6 +114,11 @@ export class TelegramAdapter
   private _botUserId?: string;
   private _userName: string;
   private readonly hasExplicitUserName: boolean;
+  private readonly mode: TelegramAdapterMode;
+  private readonly polling?: boolean | TelegramPollingConfig;
+  private pollingAbortController: AbortController | null = null;
+  private pollingTask: Promise<void> | null = null;
+  private pollingActive = false;
 
   get botUserId(): string | undefined {
     return this._botUserId;
@@ -100,6 +126,10 @@ export class TelegramAdapter
 
   get userName(): string {
     return this._userName;
+  }
+
+  get isPolling(): boolean {
+    return this.pollingActive;
   }
 
   constructor(
@@ -114,13 +144,20 @@ export class TelegramAdapter
     this.logger = config.logger;
     this._userName = this.normalizeUserName(config.userName ?? "bot");
     this.hasExplicitUserName = Boolean(config.userName);
+    this.mode = config.mode ?? "auto";
+    this.polling = config.polling;
   }
 
   async initialize(chat: ChatInstance): Promise<void> {
     this.chat = chat;
 
     if (!this.hasExplicitUserName) {
-      this._userName = this.normalizeUserName(chat.getUserName());
+      // Runtime JS consumers can omit Chat.userName even though TS marks it required.
+      // Keep a safe fallback here and let getMe() refine the username when available.
+      const chatUserName = chat.getUserName?.();
+      if (typeof chatUserName === "string" && chatUserName.trim()) {
+        this._userName = this.normalizeUserName(chatUserName);
+      }
     }
 
     try {
@@ -138,6 +175,21 @@ export class TelegramAdapter
       this.logger.warn("Failed to fetch Telegram bot identity", {
         error: String(error),
       });
+    }
+
+    const runtimeMode = await this.resolveRuntimeMode();
+    if (runtimeMode === "polling") {
+      const pollingConfig =
+        typeof this.polling === "object" ? this.polling : undefined;
+
+      if (this.mode === "auto") {
+        await this.startPolling({
+          ...pollingConfig,
+          deleteWebhook: false,
+        });
+      } else {
+        await this.startPolling(pollingConfig);
+      }
     }
   }
 
@@ -169,6 +221,121 @@ export class TelegramAdapter
       return new Response("OK", { status: 200 });
     }
 
+    this.processUpdate(update, options);
+
+    return new Response("OK", { status: 200 });
+  }
+
+  async startPolling(config?: TelegramPollingConfig): Promise<void> {
+    if (!this.chat) {
+      throw new ValidationError(
+        "telegram",
+        "Cannot start polling before initialize()"
+      );
+    }
+
+    if (this.pollingActive) {
+      this.logger.debug("Telegram polling already active");
+      return;
+    }
+
+    const resolvedConfig = this.resolvePollingConfig(config);
+    this.pollingActive = true;
+
+    try {
+      if (resolvedConfig.deleteWebhook) {
+        await this.telegramFetch<boolean>("deleteWebhook", {
+          drop_pending_updates: resolvedConfig.dropPendingUpdates,
+        });
+      }
+    } catch (error) {
+      this.pollingActive = false;
+      throw error;
+    }
+
+    this.logger.info("Telegram polling started", {
+      limit: resolvedConfig.limit,
+      timeoutSeconds: resolvedConfig.timeoutSeconds,
+      allowedUpdates: resolvedConfig.allowedUpdates,
+    });
+
+    this.pollingTask = this.pollingLoop(resolvedConfig).finally(() => {
+      this.pollingActive = false;
+      this.pollingAbortController = null;
+      this.pollingTask = null;
+    });
+  }
+
+  async stopPolling(): Promise<void> {
+    if (!this.pollingActive) {
+      return;
+    }
+
+    this.pollingActive = false;
+    this.pollingAbortController?.abort();
+
+    if (this.pollingTask) {
+      await this.pollingTask;
+    }
+
+    this.logger.info("Telegram polling stopped");
+  }
+
+  private async resolveRuntimeMode(): Promise<TelegramRuntimeMode> {
+    if (this.mode === "webhook") {
+      return "webhook";
+    }
+
+    if (this.mode === "polling") {
+      return "polling";
+    }
+
+    const webhookInfo = await this.fetchWebhookInfo();
+    if (typeof webhookInfo?.url === "string" && webhookInfo.url.trim()) {
+      this.logger.debug("Telegram auto mode selected webhook mode", {
+        webhookUrl: webhookInfo.url,
+      });
+      return "webhook";
+    }
+
+    if (this.isLikelyServerlessRuntime()) {
+      this.logger.warn(
+        "Telegram auto mode detected serverless runtime without webhook URL; keeping webhook mode"
+      );
+      return "webhook";
+    }
+
+    this.logger.info("Telegram auto mode selected polling mode");
+    return "polling";
+  }
+
+  private async fetchWebhookInfo(): Promise<TelegramWebhookInfo | null> {
+    try {
+      return await this.telegramFetch<TelegramWebhookInfo>("getWebhookInfo");
+    } catch (error) {
+      this.logger.warn("Failed to fetch Telegram webhook info", {
+        error: String(error),
+      });
+      return null;
+    }
+  }
+
+  private isLikelyServerlessRuntime(): boolean {
+    if (typeof process === "undefined" || !process.env) {
+      return false;
+    }
+
+    return Boolean(
+      process.env.VERCEL ||
+        process.env.AWS_LAMBDA_FUNCTION_NAME ||
+        process.env.AWS_EXECUTION_ENV?.includes("AWS_Lambda") ||
+        process.env.FUNCTIONS_WORKER_RUNTIME ||
+        process.env.NETLIFY ||
+        process.env.K_SERVICE
+    );
+  }
+
+  private processUpdate(update: TelegramUpdate, options?: WebhookOptions): void {
     const messageUpdate =
       update.message ??
       update.edited_message ??
@@ -186,8 +353,6 @@ export class TelegramAdapter
     if (update.message_reaction) {
       this.handleMessageReactionUpdate(update.message_reaction, options);
     }
-
-    return new Response("OK", { status: 200 });
   }
 
   private handleIncomingMessageUpdate(
@@ -1160,7 +1325,11 @@ export class TelegramAdapter
     return input.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   }
 
-  private normalizeUserName(value: string): string {
+  private normalizeUserName(value: unknown): string {
+    if (typeof value !== "string") {
+      return "bot";
+    }
+
     return value.replace(LEADING_AT_PATTERN, "").trim() || "bot";
   }
 
@@ -1232,9 +1401,132 @@ export class TelegramAdapter
     return getEmoji(`custom:${reaction.custom_emoji_id}`);
   }
 
+  private async pollingLoop(
+    config: ResolvedTelegramPollingConfig
+  ): Promise<void> {
+    let offset: number | undefined;
+
+    while (this.pollingActive) {
+      this.pollingAbortController = new AbortController();
+
+      try {
+        const updates = await this.telegramFetch<TelegramUpdate[]>(
+          "getUpdates",
+          {
+            allowed_updates: config.allowedUpdates,
+            limit: config.limit,
+            offset,
+            timeout: config.timeoutSeconds,
+          },
+          { signal: this.pollingAbortController.signal }
+        );
+
+        for (const update of updates) {
+          offset = update.update_id + 1;
+
+          try {
+            this.processUpdate(update);
+          } catch (error) {
+            this.logger.warn("Failed to process Telegram polled update", {
+              error: String(error),
+              updateId: update.update_id,
+            });
+          }
+        }
+      } catch (error) {
+        if (this.isAbortError(error)) {
+          return;
+        }
+
+        this.logger.warn("Telegram polling request failed", {
+          error: String(error),
+          retryDelayMs: config.retryDelayMs,
+        });
+
+        if (!this.pollingActive) {
+          return;
+        }
+
+        await this.sleep(config.retryDelayMs);
+      } finally {
+        this.pollingAbortController = null;
+      }
+    }
+  }
+
+  private resolvePollingConfig(
+    override?: TelegramPollingConfig
+  ): ResolvedTelegramPollingConfig {
+    const baseConfig =
+      this.polling && typeof this.polling === "object" ? this.polling : {};
+    const merged = {
+      ...baseConfig,
+      ...override,
+    };
+    const timeoutSeconds = merged.timeout ?? merged.timeoutSeconds;
+
+    return {
+      allowedUpdates:
+        merged.allowedUpdates && merged.allowedUpdates.length > 0
+          ? [...merged.allowedUpdates]
+          : undefined,
+      deleteWebhook: merged.deleteWebhook ?? true,
+      dropPendingUpdates: merged.dropPendingUpdates ?? false,
+      limit: this.clampInteger(
+        merged.limit,
+        TELEGRAM_DEFAULT_POLLING_LIMIT,
+        TELEGRAM_MIN_POLLING_LIMIT,
+        TELEGRAM_MAX_POLLING_LIMIT
+      ),
+      retryDelayMs: this.clampInteger(
+        merged.retryDelayMs,
+        TELEGRAM_DEFAULT_POLLING_RETRY_DELAY_MS,
+        0,
+        Number.MAX_SAFE_INTEGER
+      ),
+      timeoutSeconds: this.clampInteger(
+        timeoutSeconds,
+        TELEGRAM_DEFAULT_POLLING_TIMEOUT_SECONDS,
+        TELEGRAM_MIN_POLLING_TIMEOUT_SECONDS,
+        TELEGRAM_MAX_POLLING_TIMEOUT_SECONDS
+      ),
+    };
+  }
+
+  private clampInteger(
+    value: number | undefined,
+    fallback: number,
+    min: number,
+    max: number
+  ): number {
+    if (typeof value !== "number" || !Number.isFinite(value)) {
+      return fallback;
+    }
+
+    const parsed = Math.trunc(value);
+    return Math.max(min, Math.min(max, parsed));
+  }
+
+  private isAbortError(error: unknown): boolean {
+    return error instanceof Error && error.name === "AbortError";
+  }
+
+  private async sleep(delayMs: number): Promise<void> {
+    if (delayMs <= 0) {
+      return;
+    }
+
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, delayMs);
+    });
+  }
+
   private async telegramFetch<TResult>(
     method: string,
-    payload?: Record<string, unknown> | FormData
+    payload?: Record<string, unknown> | FormData,
+    request?: {
+      signal?: AbortSignal;
+    }
   ): Promise<TResult> {
     const url = `${this.apiBaseUrl}/bot${this.botToken}/${method}`;
 
@@ -1250,8 +1542,13 @@ export class TelegramAdapter
               },
         body:
           payload instanceof FormData ? payload : JSON.stringify(payload ?? {}),
+        signal: request?.signal,
       });
     } catch (error) {
+      if (this.isAbortError(error)) {
+        throw error;
+      }
+
       throw new NetworkError(
         "telegram",
         `Network error calling Telegram ${method}`,
@@ -1338,10 +1635,20 @@ export function createTelegramAdapter(
   const secretToken =
     config?.secretToken ?? process.env.TELEGRAM_WEBHOOK_SECRET_TOKEN;
   const userName = config?.userName ?? process.env.TELEGRAM_BOT_USERNAME;
+  const mode = config?.mode ?? "auto";
+
+  if (!["auto", "webhook", "polling"].includes(mode)) {
+    throw new ValidationError(
+      "telegram",
+      `Invalid mode: ${mode}. Expected "auto", "webhook", or "polling".`
+    );
+  }
 
   return new TelegramAdapter({
     botToken,
     apiBaseUrl,
+    mode,
+    polling: config?.polling,
     secretToken,
     logger: config?.logger ?? new ConsoleLogger("info").child("telegram"),
     userName,
@@ -1351,12 +1658,15 @@ export function createTelegramAdapter(
 export { TelegramFormatConverter } from "./markdown";
 export type {
   TelegramAdapterConfig,
+  TelegramAdapterMode,
   TelegramCallbackQuery,
   TelegramChat,
   TelegramMessage,
   TelegramMessageReactionUpdated,
+  TelegramPollingConfig,
   TelegramRawMessage,
   TelegramThreadId,
   TelegramUpdate,
   TelegramUser,
+  TelegramWebhookInfo,
 } from "./types";
