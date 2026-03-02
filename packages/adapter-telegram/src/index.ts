@@ -21,6 +21,7 @@ import type {
   FormattedContent,
   Logger,
   RawMessage,
+  StreamOptions,
   ThreadInfo,
   WebhookOptions,
 } from "chat";
@@ -76,6 +77,8 @@ const TELEGRAM_MAX_POLLING_LIMIT = 100;
 const TELEGRAM_MIN_POLLING_LIMIT = 1;
 const TELEGRAM_MIN_POLLING_TIMEOUT_SECONDS = 0;
 const TELEGRAM_MAX_POLLING_TIMEOUT_SECONDS = 300;
+const TELEGRAM_STREAM_PLACEHOLDER = "...";
+const TELEGRAM_DEFAULT_STREAM_UPDATE_INTERVAL_MS = 350;
 interface TelegramMessageAuthor {
   fullName: string;
   isBot: boolean | "unknown";
@@ -739,6 +742,117 @@ export class TelegramAdapter
     });
   }
 
+  async stream(
+    threadId: string,
+    textStream: AsyncIterable<string>,
+    options?: StreamOptions
+  ): Promise<RawMessage<TelegramRawMessage>> {
+    const parsedThread = this.resolveThreadId(threadId);
+
+    // Telegram drafts are currently private-chat only, so keep post+edit for groups/topics.
+    if (parsedThread.messageThreadId || !this.isDM(threadId)) {
+      return this.streamViaPostEdit(threadId, textStream, options);
+    }
+
+    const updateIntervalMs = Math.max(
+      0,
+      options?.updateIntervalMs ?? TELEGRAM_DEFAULT_STREAM_UPDATE_INTERVAL_MS
+    );
+
+    const iterator = textStream[Symbol.asyncIterator]();
+    const draftId = this.createDraftId();
+    let rawAccumulated = "";
+    let renderedAccumulated = "";
+    let lastDraftText = "";
+    let lastDraftSentAt = 0;
+    let draftStreamingEnabled = true;
+    let draftUpdatesSent = 0;
+
+    while (true) {
+      const next = await iterator.next();
+      if (next.done) {
+        break;
+      }
+
+      rawAccumulated += next.value;
+      renderedAccumulated = this.renderStreamText(rawAccumulated);
+
+      if (!draftStreamingEnabled || !renderedAccumulated.trim()) {
+        continue;
+      }
+
+      const now = Date.now();
+      const shouldSendDraft =
+        draftUpdatesSent === 0 ||
+        (renderedAccumulated !== lastDraftText &&
+          now - lastDraftSentAt >= updateIntervalMs);
+
+      if (!shouldSendDraft) {
+        continue;
+      }
+
+      try {
+        await this.sendDraftMessage(parsedThread.chatId, draftId, renderedAccumulated);
+        lastDraftText = renderedAccumulated;
+        lastDraftSentAt = now;
+        draftUpdatesSent += 1;
+      } catch (error) {
+        if (draftUpdatesSent === 0 && this.isDraftMethodUnsupported(error)) {
+          this.logger.info(
+            "Telegram: sendMessageDraft unavailable, falling back to post+edit streaming"
+          );
+
+          const resumedTextStream = (async function* (
+            consumed: string,
+            remaining: AsyncIterator<string>
+          ): AsyncIterable<string> {
+            if (consumed) {
+              yield consumed;
+            }
+
+            while (true) {
+              const item = await remaining.next();
+              if (item.done) {
+                return;
+              }
+              yield item.value;
+            }
+          })(rawAccumulated, iterator);
+
+          return this.streamViaPostEdit(threadId, resumedTextStream, options);
+        }
+
+        this.logger.warn(
+          "Telegram: sendMessageDraft failed during stream; continuing without draft updates",
+          {
+            error: String(error),
+          }
+        );
+        draftStreamingEnabled = false;
+      }
+    }
+
+    if (!rawAccumulated.trim()) {
+      throw new ValidationError("telegram", "Message text cannot be empty");
+    }
+
+    renderedAccumulated = this.renderStreamText(rawAccumulated);
+    if (draftStreamingEnabled && renderedAccumulated !== lastDraftText) {
+      try {
+        await this.sendDraftMessage(parsedThread.chatId, draftId, renderedAccumulated);
+      } catch (error) {
+        this.logger.warn(
+          "Telegram: final sendMessageDraft update failed; sending final message anyway",
+          {
+            error: String(error),
+          }
+        );
+      }
+    }
+
+    return this.postMessage(threadId, rawAccumulated);
+  }
+
   async fetchMessages(
     threadId: string,
     options: FetchOptions = {}
@@ -1352,6 +1466,118 @@ export class TelegramAdapter
 
   private escapeRegex(input: string): string {
     return input.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  }
+
+  private async streamViaPostEdit(
+    threadId: string,
+    textStream: AsyncIterable<string>,
+    options?: StreamOptions
+  ): Promise<RawMessage<TelegramRawMessage>> {
+    const intervalMs = Math.max(
+      0,
+      options?.updateIntervalMs ?? TELEGRAM_DEFAULT_STREAM_UPDATE_INTERVAL_MS
+    );
+    const posted = await this.postMessage(threadId, TELEGRAM_STREAM_PLACEHOLDER);
+    const threadIdForEdits = posted.threadId || threadId;
+
+    let rawAccumulated = "";
+    let lastRendered = TELEGRAM_STREAM_PLACEHOLDER;
+    let lastEditAt = Date.now();
+
+    for await (const chunk of textStream) {
+      rawAccumulated += chunk;
+
+      const rendered = this.renderStreamText(rawAccumulated);
+      const now = Date.now();
+      const shouldEdit =
+        rendered.trim() &&
+        rendered !== lastRendered &&
+        now - lastEditAt >= intervalMs;
+
+      if (!shouldEdit) {
+        continue;
+      }
+
+      try {
+        await this.editMessage(threadIdForEdits, posted.id, rawAccumulated);
+        lastRendered = rendered;
+        lastEditAt = now;
+      } catch (error) {
+        this.logger.debug("Telegram: intermediate stream edit failed", {
+          error: String(error),
+          threadId: threadIdForEdits,
+          messageId: posted.id,
+        });
+      }
+    }
+
+    if (!rawAccumulated.trim()) {
+      try {
+        await this.deleteMessage(threadIdForEdits, posted.id);
+      } catch (error) {
+        this.logger.debug("Telegram: failed to cleanup empty stream placeholder", {
+          error: String(error),
+          threadId: threadIdForEdits,
+          messageId: posted.id,
+        });
+      }
+      throw new ValidationError("telegram", "Message text cannot be empty");
+    }
+
+    const finalRendered = this.renderStreamText(rawAccumulated);
+    if (finalRendered.trim() && finalRendered !== lastRendered) {
+      return this.editMessage(threadIdForEdits, posted.id, rawAccumulated);
+    }
+
+    return posted;
+  }
+
+  private createDraftId(): string {
+    if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+      return crypto.randomUUID();
+    }
+
+    return `draft-${Date.now().toString(36)}-${Math.random()
+      .toString(36)
+      .slice(2, 10)}`;
+  }
+
+  private async sendDraftMessage(
+    chatId: string,
+    draftId: string,
+    text: string
+  ): Promise<void> {
+    await this.telegramFetch<boolean>("sendMessageDraft", {
+      chat_id: chatId,
+      draft_id: draftId,
+      text,
+    });
+  }
+
+  private isDraftMethodUnsupported(error: unknown): boolean {
+    if (
+      error instanceof ResourceNotFoundError &&
+      error.resourceType === "sendMessageDraft"
+    ) {
+      return true;
+    }
+
+    if (error instanceof ValidationError) {
+      const lower = error.message.toLowerCase();
+      return (
+        lower.includes("sendmessagedraft") ||
+        lower.includes("method not found") ||
+        lower.includes("unknown method") ||
+        lower.includes("method is not available")
+      );
+    }
+
+    return false;
+  }
+
+  private renderStreamText(rawText: string): string {
+    // Telegram expects Unicode emoji, and the gchat resolver emits Unicode output.
+    return this.truncateMessage(convertEmojiPlaceholders(rawText, "gchat"));
   }
 
   private normalizeUserName(value: unknown): string {
