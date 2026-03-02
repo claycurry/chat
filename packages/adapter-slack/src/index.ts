@@ -9,6 +9,7 @@ import {
   toBuffer,
   ValidationError,
 } from "@chat-adapter/shared";
+import { SocketModeClient } from "@slack/socket-mode";
 import { WebClient } from "@slack/web-api";
 import type {
   ActionEvent,
@@ -91,7 +92,11 @@ function findNextMention(text: string): number {
 const SLACK_MESSAGE_URL_PATTERN =
   /^https?:\/\/[^/]+\.slack\.com\/archives\/([A-Z0-9]+)\/p(\d+)(?:\?.*)?$/;
 
+export type SlackAdapterMode = "webhook" | "socket";
+
 export interface SlackAdapterConfig {
+  /** App-level token (xapp-...). Required for socket mode. */
+  appToken?: string;
   /** Bot token (xoxb-...). Required for single-workspace mode. Omit for multi-workspace. */
   botToken?: string;
   /** Bot user ID (will be fetched if not provided) */
@@ -112,6 +117,8 @@ export interface SlackAdapterConfig {
   installationKeyPrefix?: string;
   /** Logger instance for error reporting. Defaults to ConsoleLogger. */
   logger?: Logger;
+  /** Connection mode: "webhook" (default) or "socket" */
+  mode?: SlackAdapterMode;
   /** Signing secret for webhook verification. Defaults to SLACK_SIGNING_SECRET env var. */
   signingSecret?: string;
   /** Override bot username (optional) */
@@ -375,6 +382,11 @@ export class SlackAdapter implements Adapter<SlackThreadId, unknown> {
   private static CHANNEL_CACHE_TTL_MS = 8 * 24 * 60 * 60 * 1000; // 8 days
   private static REVERSE_INDEX_TTL_MS = 8 * 24 * 60 * 60 * 1000; // 8 days
 
+  // Socket mode support
+  private readonly appToken: string | undefined;
+  private readonly mode: SlackAdapterMode;
+  private socketClient: SocketModeClient | null = null;
+
   // Multi-workspace support
   private readonly clientId: string | undefined;
   private readonly clientSecret: string | undefined;
@@ -394,13 +406,17 @@ export class SlackAdapter implements Adapter<SlackThreadId, unknown> {
     return this._botUserId || undefined;
   }
 
+  get isSocketMode(): boolean {
+    return this.mode === "socket";
+  }
+
   constructor(config: SlackAdapterConfig = {}) {
     const signingSecret =
       config.signingSecret ?? process.env.SLACK_SIGNING_SECRET;
-    if (!signingSecret) {
+    if (!signingSecret && (config.mode ?? "webhook") === "webhook") {
       throw new ValidationError(
         "slack",
-        "signingSecret is required. Set SLACK_SIGNING_SECRET or provide it in config."
+        "signingSecret is required for webhook mode. Set SLACK_SIGNING_SECRET or provide it in config."
       );
     }
 
@@ -419,11 +435,14 @@ export class SlackAdapter implements Adapter<SlackThreadId, unknown> {
       config.botToken ?? (zeroConfig ? process.env.SLACK_BOT_TOKEN : undefined);
 
     this.client = new WebClient(botToken);
-    this.signingSecret = signingSecret;
+    this.signingSecret = signingSecret ?? "";
     this.defaultBotToken = botToken;
     this.logger = config.logger ?? new ConsoleLogger("info").child("slack");
     this.userName = config.userName || "bot";
     this._botUserId = config.botUserId || null;
+
+    this.appToken = config.appToken;
+    this.mode = config.mode ?? "webhook";
 
     this.clientId =
       config.clientId ?? (zeroConfig ? process.env.SLACK_CLIENT_ID : undefined);
@@ -492,6 +511,10 @@ export class SlackAdapter implements Adapter<SlackThreadId, unknown> {
 
     if (!this.defaultBotToken) {
       this.logger.info("Slack adapter initialized in multi-workspace mode");
+    }
+
+    if (this.mode === "socket") {
+      await this.startSocketMode();
     }
   }
 
@@ -812,6 +835,12 @@ export class SlackAdapter implements Adapter<SlackThreadId, unknown> {
     request: Request,
     options?: WebhookOptions
   ): Promise<Response> {
+    if (this.mode === "socket") {
+      return new Response("Webhooks are disabled in socket mode", {
+        status: 405,
+      });
+    }
+
     const body = await request.text();
     this.logger.debug("Slack webhook raw body", { body });
 
