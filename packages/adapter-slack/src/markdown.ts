@@ -86,10 +86,13 @@ export class SlackFormatConverter extends BaseFormatConverter {
     markdown = markdown.replace(/<#([A-Z0-9_]+)>/g, "#$1");
 
     // Links: <url|text> -> [text](url)
-    markdown = markdown.replace(/<(https?:\/\/[^|>]+)\|([^>]+)>/g, "[$2]($1)");
+    markdown = markdown.replace(
+      /<(https?:\/\/[^|<>]+)\|([^<>]+)>/g,
+      "[$2]($1)"
+    );
 
     // Bare links: <url> -> url
-    markdown = markdown.replace(/<(https?:\/\/[^>]+)>/g, "$1");
+    markdown = markdown.replace(/<(https?:\/\/[^<>]+)>/g, "$1");
 
     // Bold: *text* -> **text** (but be careful with emphasis)
     // This is tricky because Slack uses * for bold, not emphasis
