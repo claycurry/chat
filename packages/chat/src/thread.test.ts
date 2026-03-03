@@ -311,10 +311,7 @@ describe("ThreadImpl", () => {
       const mockStream = vi
         .fn()
         .mockImplementation(
-          async (
-            _threadId: string,
-            textStream: AsyncIterable<string>
-          ) => {
+          async (_threadId: string, textStream: AsyncIterable<string>) => {
             capturedChunks = [];
             for await (const chunk of textStream) {
               capturedChunks.push(chunk);
@@ -357,10 +354,7 @@ describe("ThreadImpl", () => {
       const mockStream = vi
         .fn()
         .mockImplementation(
-          async (
-            _threadId: string,
-            textStream: AsyncIterable<string>
-          ) => {
+          async (_threadId: string, textStream: AsyncIterable<string>) => {
             capturedChunks = [];
             for await (const chunk of textStream) {
               capturedChunks.push(chunk);
@@ -375,19 +369,11 @@ describe("ThreadImpl", () => {
       mockAdapter.stream = mockStream;
 
       // Simulate an LLM streaming two paragraphs with double newline
-      const textStream = createTextStream([
-        "hello.",
-        "\n\n",
-        "how are you?",
-      ]);
+      const textStream = createTextStream(["hello.", "\n\n", "how are you?"]);
       const result = await thread.post(textStream);
 
       expect(result.text).toBe("hello.\n\nhow are you?");
-      expect(capturedChunks).toEqual([
-        "hello.",
-        "\n\n",
-        "how are you?",
-      ]);
+      expect(capturedChunks).toEqual(["hello.", "\n\n", "how are you?"]);
     });
 
     it("should concatenate multi-step text without separator (demonstrates bug)", async () => {
@@ -395,10 +381,7 @@ describe("ThreadImpl", () => {
       const mockStream = vi
         .fn()
         .mockImplementation(
-          async (
-            _threadId: string,
-            textStream: AsyncIterable<string>
-          ) => {
+          async (_threadId: string, textStream: AsyncIterable<string>) => {
             capturedChunks = [];
             for await (const chunk of textStream) {
               capturedChunks.push(chunk);
@@ -431,11 +414,7 @@ describe("ThreadImpl", () => {
     it("should preserve newlines in fallback streaming path", async () => {
       mockAdapter.stream = undefined;
 
-      const textStream = createTextStream([
-        "hello.",
-        "\n",
-        "how are you?",
-      ]);
+      const textStream = createTextStream(["hello.", "\n", "how are you?"]);
       const result = await thread.post(textStream);
 
       // Final edit should have all accumulated text with newline preserved
@@ -488,6 +467,38 @@ describe("ThreadImpl", () => {
         expect.objectContaining({
           recipientUserId: "U456",
           recipientTeamId: "T123",
+          updateIntervalMs: 500,
+          fallbackPlaceholderText: "...",
+        })
+      );
+    });
+
+    it("should pass custom fallback stream config to native stream adapters", async () => {
+      const mockStream = vi.fn().mockResolvedValue({
+        id: "msg-stream",
+        threadId: "t1",
+        raw: "Hello",
+      });
+      mockAdapter.stream = mockStream;
+
+      const configuredThread = new ThreadImpl({
+        id: "slack:C123:1234.5678",
+        adapter: mockAdapter,
+        channelId: "C123",
+        stateAdapter: mockState,
+        streamingUpdateIntervalMs: 123,
+        fallbackStreamingPlaceholderText: null,
+      });
+
+      const textStream = createTextStream(["Hello"]);
+      await configuredThread.post(textStream);
+
+      expect(mockStream).toHaveBeenCalledWith(
+        "slack:C123:1234.5678",
+        expect.any(Object),
+        expect.objectContaining({
+          updateIntervalMs: 123,
+          fallbackPlaceholderText: null,
         })
       );
     });

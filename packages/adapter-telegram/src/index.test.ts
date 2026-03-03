@@ -1174,7 +1174,8 @@ describe("TelegramAdapter", () => {
     await adapter.initialize(createMockChat());
 
     await adapter.postMessage("telegram:123", {
-      markdown: "**Bold** _italic_ [Docs](https://example.com) `code`",
+      markdown:
+        "**Bold** _italic_ [Docs](https://example.com) `code`\n\n> Quote",
     });
 
     const sendMessageBody = JSON.parse(
@@ -1188,6 +1189,57 @@ describe("TelegramAdapter", () => {
       '<a href="https://example.com">Docs</a>'
     );
     expect(sendMessageBody.text).toContain("<code>code</code>");
+    expect(sendMessageBody.text).toContain("<blockquote>Quote</blockquote>");
+  });
+
+  it("supports disabling fallback placeholder in non-DM stream fallback", async () => {
+    mockFetch
+      .mockResolvedValueOnce(
+        telegramOk({
+          id: 999,
+          is_bot: true,
+          first_name: "Bot",
+          username: "mybot",
+        })
+      )
+      .mockResolvedValueOnce(
+        telegramOk(
+          sampleMessage({
+            chat: { id: -100123, type: "supergroup", title: "General" },
+            text: "hello",
+          })
+        )
+      );
+
+    const adapter = createTelegramAdapter({
+      botToken: "token",
+      mode: "webhook",
+      logger: mockLogger,
+      userName: "mybot",
+    });
+
+    await adapter.initialize(createMockChat());
+
+    const stream = (async function* () {
+      yield "hello";
+    })();
+
+    await adapter.stream("telegram:-100123", stream, {
+      updateIntervalMs: 0,
+      fallbackPlaceholderText: null,
+    });
+
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+    const sendMessageUrl = String(mockFetch.mock.calls[1]?.[0]);
+    expect(sendMessageUrl).toContain("/sendMessage");
+
+    const sendMessageBody = JSON.parse(
+      String((mockFetch.mock.calls[1]?.[1] as RequestInit).body)
+    ) as { chat_id: string; text: string; parse_mode?: string };
+
+    expect(sendMessageBody.chat_id).toBe("-100123");
+    expect(sendMessageBody.text).toBe("hello");
+    expect(sendMessageBody.parse_mode).toBe("HTML");
   });
 
   it("streams markdown drafts with Telegram HTML parse mode", async () => {

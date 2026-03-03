@@ -413,7 +413,10 @@ export class ThreadImpl<TState = Record<string, unknown>>
     textStream: AsyncIterable<string>
   ): Promise<SentMessage> {
     // Build streaming options from current message context
-    const options: StreamOptions = {};
+    const options: StreamOptions = {
+      updateIntervalMs: this._streamingUpdateIntervalMs,
+      fallbackPlaceholderText: this._fallbackStreamingPlaceholderText,
+    };
     if (this._currentMessage) {
       options.recipientUserId = this._currentMessage.author.userId;
       // Extract teamId from raw Slack payload

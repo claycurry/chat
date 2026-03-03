@@ -93,10 +93,7 @@ export class TelegramFormatConverter extends BaseFormatConverter {
       const content = getNodeChildren(node)
         .map((child) => this.nodeToTelegramHtml(child))
         .join("");
-      return content
-        .split("\n")
-        .map((line) => `&gt;${line ? ` ${line}` : ""}`)
-        .join("\n");
+      return `<blockquote>${content}</blockquote>`;
     }
 
     if (isListNode(node)) {

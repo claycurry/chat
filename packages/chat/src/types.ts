@@ -326,13 +326,15 @@ export interface Adapter<TThreadId = unknown, TRawMessage = unknown> {
  * Platform-specific options are passed through to the adapter.
  */
 export interface StreamOptions {
+  /** Placeholder text for adapter-managed post+edit fallback streams. Set to null to disable. */
+  fallbackPlaceholderText?: string | null;
   /** Slack: The team/workspace ID */
   recipientTeamId?: string;
   /** Slack: The user ID to stream to (for AI assistant context) */
   recipientUserId?: string;
   /** Block Kit elements to attach when stopping the stream (Slack only, via chat.stopStream) */
   stopBlocks?: unknown[];
-  /** Minimum interval between updates in ms (default: 1000). Used for fallback mode (GChat/Teams). */
+  /** Minimum interval between updates in ms (default: 500). */
   updateIntervalMs?: number;
 }
 

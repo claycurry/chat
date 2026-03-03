@@ -1480,14 +1480,18 @@ export class TelegramAdapter
       0,
       options?.updateIntervalMs ?? TELEGRAM_DEFAULT_STREAM_UPDATE_INTERVAL_MS
     );
-    const posted = await this.postMessage(
-      threadId,
-      TELEGRAM_STREAM_PLACEHOLDER
-    );
-    const threadIdForEdits = posted.threadId || threadId;
+    const placeholderText =
+      options?.fallbackPlaceholderText === undefined
+        ? TELEGRAM_STREAM_PLACEHOLDER
+        : options.fallbackPlaceholderText;
+    let posted =
+      placeholderText === null
+        ? null
+        : await this.postMessage(threadId, placeholderText);
+    let threadIdForEdits = posted?.threadId || threadId;
 
     let rawAccumulated = "";
-    let lastRendered = TELEGRAM_STREAM_PLACEHOLDER;
+    let lastRendered = placeholderText ?? "";
     let lastEditAt = Date.now();
 
     for await (const chunk of textStream) {
@@ -1495,6 +1499,21 @@ export class TelegramAdapter
 
       const rendered = this.renderStreamMarkdown(rawAccumulated);
       const now = Date.now();
+
+      if (!posted) {
+        if (!rendered.trim()) {
+          continue;
+        }
+
+        posted = await this.postMessage(threadId, {
+          markdown: rawAccumulated,
+        });
+        threadIdForEdits = posted.threadId || threadId;
+        lastRendered = rendered;
+        lastEditAt = now;
+        continue;
+      }
+
       const shouldEdit =
         rendered.trim() &&
         rendered !== lastRendered &&
@@ -1520,19 +1539,27 @@ export class TelegramAdapter
     }
 
     if (!rawAccumulated.trim()) {
-      try {
-        await this.deleteMessage(threadIdForEdits, posted.id);
-      } catch (error) {
-        this.logger.debug(
-          "Telegram: failed to cleanup empty stream placeholder",
-          {
-            error: String(error),
-            threadId: threadIdForEdits,
-            messageId: posted.id,
-          }
-        );
+      if (posted) {
+        try {
+          await this.deleteMessage(threadIdForEdits, posted.id);
+        } catch (error) {
+          this.logger.debug(
+            "Telegram: failed to cleanup empty stream placeholder",
+            {
+              error: String(error),
+              threadId: threadIdForEdits,
+              messageId: posted.id,
+            }
+          );
+        }
       }
       throw new ValidationError("telegram", "Message text cannot be empty");
+    }
+
+    if (!posted) {
+      return this.postMessage(threadId, {
+        markdown: rawAccumulated,
+      });
     }
 
     const finalRendered = this.renderStreamMarkdown(rawAccumulated);
