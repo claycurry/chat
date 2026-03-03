@@ -94,6 +94,13 @@ const SLACK_MESSAGE_URL_PATTERN =
 
 export type SlackAdapterMode = "webhook" | "socket";
 
+/** Envelope for events forwarded from a socket mode listener via HTTP POST */
+export interface SlackForwardedSocketEvent {
+  body: Record<string, unknown>;
+  timestamp: number;
+  type: "socket_event";
+}
+
 export interface SlackAdapterConfig {
   /** App-level token (xapp-...). Required for socket mode. */
   appToken?: string;
@@ -835,6 +842,24 @@ export class SlackAdapter implements Adapter<SlackThreadId, unknown> {
     request: Request,
     options?: WebhookOptions
   ): Promise<Response> {
+    // Check for forwarded socket mode events (from external socket listener)
+    const socketToken = request.headers.get("x-slack-socket-token");
+    if (socketToken) {
+      if (!this.appToken || socketToken !== this.appToken) {
+        this.logger.warn("Invalid socket forwarding token");
+        return new Response("Invalid socket token", { status: 401 });
+      }
+      this.logger.info("Slack forwarded socket event received");
+      try {
+        const body = await request.text();
+        const event = JSON.parse(body) as SlackForwardedSocketEvent;
+        this.routeSocketEvent(event.body, options);
+        return new Response("ok", { status: 200 });
+      } catch {
+        return new Response("Invalid JSON", { status: 400 });
+      }
+    }
+
     if (this.mode === "socket") {
       return new Response("Webhooks are disabled in socket mode", {
         status: 405,
@@ -1313,12 +1338,28 @@ export class SlackAdapter implements Adapter<SlackThreadId, unknown> {
   /**
    * Route a socket mode event to the appropriate handler.
    */
-  private routeSocketEvent(body: Record<string, unknown>): void {
+  private routeSocketEvent(
+    body: Record<string, unknown>,
+    options?: WebhookOptions
+  ): void {
     const type = body.type as string;
+
+    const wrapAsync = (promise: Promise<unknown>): void => {
+      if (options?.waitUntil) {
+        options.waitUntil(promise);
+      } else {
+        promise.catch((error) => {
+          this.logger.error("Error in socket mode async handler", { error });
+        });
+      }
+    };
 
     switch (type) {
       case "event_callback":
-        this.processEventPayload(body as unknown as SlackWebhookPayload);
+        this.processEventPayload(
+          body as unknown as SlackWebhookPayload,
+          options
+        );
         break;
 
       case "slash_commands": {
@@ -1328,25 +1369,16 @@ export class SlackAdapter implements Adapter<SlackThreadId, unknown> {
             params.set(key, value);
           }
         }
-        this.handleSlashCommand(params).catch((error) => {
-          this.logger.error("Error handling slash command via socket mode", {
-            error,
-          });
-        });
+        wrapAsync(this.handleSlashCommand(params, options));
         break;
       }
 
       case "interactive": {
         const payload = body.payload as SlackInteractivePayload | undefined;
         if (payload) {
-          const result = this.dispatchInteractivePayload(payload);
+          const result = this.dispatchInteractivePayload(payload, options);
           if (result instanceof Promise) {
-            result.catch((error) => {
-              this.logger.error(
-                "Error handling interactive payload via socket mode",
-                { error }
-              );
-            });
+            wrapAsync(result);
           }
         }
         break;
@@ -1354,6 +1386,179 @@ export class SlackAdapter implements Adapter<SlackThreadId, unknown> {
 
       default:
         this.logger.debug("Unhandled socket mode event type", { type });
+    }
+  }
+
+  /**
+   * Start a transient Socket Mode listener for serverless environments.
+   * The listener maintains a WebSocket for `durationMs`, acks events, and
+   * forwards them via HTTP POST to the webhook endpoint (or processes directly).
+   *
+   * @param options - Webhook options with waitUntil function
+   * @param durationMs - How long to keep listening (default: 180000ms = 3 minutes)
+   * @param abortSignal - Optional signal to stop the listener early
+   * @param webhookUrl - URL to forward socket events to (required for forwarding mode)
+   */
+  async startSocketModeListener(
+    options: WebhookOptions,
+    durationMs = 180000,
+    abortSignal?: AbortSignal,
+    webhookUrl?: string
+  ): Promise<Response> {
+    if (!this.appToken) {
+      return new Response("appToken is required for socket mode listener", {
+        status: 500,
+      });
+    }
+
+    if (!options.waitUntil) {
+      return new Response("waitUntil not provided", { status: 500 });
+    }
+
+    this.logger.info("Starting Slack socket mode listener", {
+      durationMs,
+      webhookUrl: webhookUrl ? "configured" : "not configured",
+    });
+
+    const listenerPromise = this.runSocketModeListener(
+      durationMs,
+      abortSignal,
+      webhookUrl,
+      options
+    );
+
+    options.waitUntil(listenerPromise);
+
+    return new Response(
+      JSON.stringify({
+        status: "listening",
+        durationMs,
+        message: `Socket mode listener started, will run for ${durationMs / 1000} seconds`,
+      }),
+      {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }
+    );
+  }
+
+  /**
+   * Run the socket mode listener for a specified duration.
+   */
+  private async runSocketModeListener(
+    durationMs: number,
+    abortSignal?: AbortSignal,
+    webhookUrl?: string,
+    options?: WebhookOptions
+  ): Promise<void> {
+    // appToken is guaranteed to exist — callers check before invoking
+    const appToken = this.appToken as string;
+    const client = new SocketModeClient({ appToken });
+    let isShuttingDown = false;
+
+    client.on("slack_event", async ({ ack, body, retry_num }) => {
+      if (isShuttingDown) {
+        return;
+      }
+
+      await ack();
+
+      if (retry_num && retry_num > 0) {
+        this.logger.debug("Skipping socket mode retry", { retry_num });
+        return;
+      }
+
+      if (webhookUrl) {
+        await this.forwardSocketEvent(webhookUrl, {
+          type: "socket_event",
+          body: body as Record<string, unknown>,
+          timestamp: Date.now(),
+        });
+      } else {
+        this.routeSocketEvent(body as Record<string, unknown>, options);
+      }
+    });
+
+    try {
+      await client.start();
+      this.logger.info("Slack socket mode listener connected");
+
+      await new Promise<void>((resolve) => {
+        const timeout = setTimeout(resolve, durationMs);
+
+        if (abortSignal) {
+          if (abortSignal.aborted) {
+            clearTimeout(timeout);
+            resolve();
+            return;
+          }
+          abortSignal.addEventListener(
+            "abort",
+            () => {
+              this.logger.info(
+                "Slack socket mode listener received abort signal"
+              );
+              clearTimeout(timeout);
+              resolve();
+            },
+            { once: true }
+          );
+        }
+      });
+
+      this.logger.info(
+        "Slack socket mode listener duration elapsed, disconnecting"
+      );
+    } catch (error) {
+      this.logger.error("Slack socket mode listener error", {
+        error: String(error),
+      });
+    } finally {
+      isShuttingDown = true;
+      await client.disconnect();
+      this.logger.info("Slack socket mode listener stopped");
+    }
+  }
+
+  /**
+   * Forward a socket mode event to the webhook endpoint.
+   */
+  private async forwardSocketEvent(
+    webhookUrl: string,
+    event: SlackForwardedSocketEvent
+  ): Promise<void> {
+    try {
+      this.logger.debug("Forwarding socket event to webhook", {
+        type: (event.body.type as string) || "unknown",
+        webhookUrl,
+      });
+
+      const response = await fetch(webhookUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-slack-socket-token": this.appToken as string,
+        },
+        body: JSON.stringify(event),
+      });
+
+      if (response.ok) {
+        this.logger.debug("Socket event forwarded successfully", {
+          type: (event.body.type as string) || "unknown",
+        });
+      } else {
+        const errorText = await response.text();
+        this.logger.error("Failed to forward socket event", {
+          type: (event.body.type as string) || "unknown",
+          status: response.status,
+          error: errorText,
+        });
+      }
+    } catch (error) {
+      this.logger.error("Error forwarding socket event", {
+        type: (event.body.type as string) || "unknown",
+        error: String(error),
+      });
     }
   }
 
