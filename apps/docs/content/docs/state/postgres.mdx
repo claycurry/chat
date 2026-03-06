@@ -82,6 +82,10 @@ All rows are namespaced by `key_prefix`.
 - Key-value caching with TTL
 - Automatic table creation on first connect
 
+## Locking considerations
+
+The Redis state adapters use atomic `SET NX PX` for lock acquisition, which is a single atomic operation. The PostgreSQL adapter uses `INSERT ... ON CONFLICT DO UPDATE WHERE expires_at <= now()`, which relies on Postgres row-level locking. This is safe for most workloads but under extreme contention (many processes competing for the same lock simultaneously) may behave slightly differently than Redis. For high-contention distributed locking, prefer the Redis adapter.
+
 ## Expired row cleanup
 
 Unlike Redis (which handles TTL expiry natively), PostgreSQL does not automatically delete expired rows. The adapter performs opportunistic cleanup — expired locks are overwritten on the next `acquireLock()` call, and expired cache entries are deleted on the next `get()` call for that key.
