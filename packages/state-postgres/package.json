@@ -25,7 +25,6 @@
   },
   "dependencies": {
     "chat": "workspace:*",
-    "drizzle-orm": "^0.44.6",
     "postgres": "^3.4.7"
   },
   "repository": {
