@@ -141,7 +141,7 @@ export class PostgresStateAdapter implements StateAdapter {
     return {
       threadId: rows[0].thread_id as string,
       token: rows[0].token as string,
-      expiresAt: new Date(rows[0].expires_at as string).getTime(),
+      expiresAt: (rows[0].expires_at as Date).getTime(),
     };
   }
 
