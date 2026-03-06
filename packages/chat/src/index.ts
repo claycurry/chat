@@ -11,7 +11,6 @@ export {
   type MessageData,
   type SerializedMessage,
 } from "./message";
-export { isPostableObject, Plan } from "./plan";
 export type {
   AddTaskOptions,
   CompletePlanOptions,
@@ -23,11 +22,12 @@ export type {
   StartPlanOptions,
   UpdateTaskInput,
 } from "./plan";
-export { POSTABLE_OBJECT } from "./postable-object";
+export { Plan } from "./plan";
 export type {
   PostableObject,
   PostableObjectContext,
 } from "./postable-object";
+export { isPostableObject } from "./postable-object";
 export { StreamingMarkdownRenderer } from "./streaming-markdown";
 export { type SerializedThread, ThreadImpl } from "./thread";
 

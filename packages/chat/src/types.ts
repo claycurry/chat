@@ -856,12 +856,6 @@ export interface Thread<TState = Record<string, unknown>, TRawMessage = unknown>
 // Postable Objects
 // =============================================================================
 
-// Re-export PostableObject types from plan.ts for backwards compatibility
-export type {
-  PostableObject,
-  PostableObjectContext,
-} from "./postable-object";
-
 // Re-export Plan types from plan.ts for backwards compatibility
 export type {
   AddTaskOptions,
@@ -874,6 +868,11 @@ export type {
   StartPlanOptions,
   UpdateTaskInput,
 } from "./plan";
+// Re-export PostableObject types from plan.ts for backwards compatibility
+export type {
+  PostableObject,
+  PostableObjectContext,
+} from "./postable-object";
 
 export interface ThreadInfo {
   channelId: string;

@@ -1995,12 +1995,8 @@ export class SlackAdapter implements Adapter<SlackThreadId, unknown> {
     kind: string,
     data: unknown
   ): Promise<RawMessage<unknown>> {
-    // Only handle "plan" kind - other kinds should use fallback text via isSupported check
     if (kind !== "plan") {
-      // Return null to signal unsupported - caller will use fallback
-      // This shouldn't normally be reached since isSupported is checked first
-      this.logger.warn("postObject called with unsupported kind", { kind });
-      return this.postMessage(threadId, `[Unsupported object: ${kind}]`);
+      throw new Error(`Unsupported postable object kind: ${kind}`);
     }
 
     const plan = data as PlanModel;
@@ -2037,11 +2033,8 @@ export class SlackAdapter implements Adapter<SlackThreadId, unknown> {
     kind: string,
     data: unknown
   ): Promise<RawMessage<unknown>> {
-    // Only handle "plan" kind - other kinds should use fallback text via isSupported check
     if (kind !== "plan") {
-      // This shouldn't normally be reached since isSupported is checked first
-      this.logger.warn("editObject called with unsupported kind", { kind });
-      return this.editMessage(threadId, messageId, `[Unsupported object: ${kind}]`);
+      throw new Error(`Unsupported postable object kind: ${kind}`);
     }
 
     const plan = data as PlanModel;

@@ -1,16 +1,11 @@
 import type { Root } from "mdast";
 import { parseMarkdown, toPlainText } from "./markdown";
 import {
-  isPostableObject,
   POSTABLE_OBJECT,
   type PostableObject,
   type PostableObjectContext,
 } from "./postable-object";
 import type { Adapter } from "./types";
-
-// Re-export from postable-object for backwards compatibility
-export { isPostableObject };
-export type { PostableObject, PostableObjectContext };
 
 // =============================================================================
 // Plan Types (moved from types.ts per review feedback)
@@ -96,6 +91,7 @@ function contentToPlainText(content: PlanContent | undefined): string {
 
 interface BoundState {
   adapter: Adapter;
+  fallback: boolean;
   messageId: string;
   threadId: string;
   updateChain: Promise<void>;
@@ -145,14 +141,12 @@ export class Plan implements PostableObject<PlanModel> {
     const lines: string[] = [];
     lines.push(`📋 ${this._model.title || "Plan"}`);
     for (const task of this._model.tasks) {
-      const statusIcon =
-        task.status === "complete"
-          ? "✅"
-          : task.status === "in_progress"
-            ? "🔄"
-            : task.status === "error"
-              ? "❌"
-              : "⬜";
+      const statusIcons: Record<string, string> = {
+        complete: "✅",
+        in_progress: "🔄",
+        error: "❌",
+      };
+      const statusIcon = statusIcons[task.status] ?? "⬜";
       lines.push(`${statusIcon} ${task.title}`);
     }
     return lines.join("\n");
@@ -161,6 +155,7 @@ export class Plan implements PostableObject<PlanModel> {
   onPosted(context: PostableObjectContext): void {
     this._bound = {
       adapter: context.adapter,
+      fallback: !this.isSupported(context.adapter),
       messageId: context.messageId,
       threadId: context.threadId,
       updateChain: Promise.resolve(),
@@ -281,26 +276,34 @@ export class Plan implements PostableObject<PlanModel> {
   }
 
   private canMutate(): boolean {
-    return !!(this._bound && this.isSupported(this._bound.adapter));
+    return !!this._bound;
   }
 
   private enqueueEdit(): Promise<void> {
     if (!this._bound) {
       return Promise.resolve();
     }
-    const editObject = this._bound.adapter.editObject;
-    if (!editObject) {
-      return Promise.resolve();
-    }
     const bound = this._bound;
     const doEdit = async (): Promise<void> => {
-      await editObject.call(
-        bound.adapter,
-        bound.threadId,
-        bound.messageId,
-        this.kind,
-        this._model
-      );
+      if (bound.fallback) {
+        await bound.adapter.editMessage(
+          bound.threadId,
+          bound.messageId,
+          this.getFallbackText()
+        );
+      } else {
+        const editObject = bound.adapter.editObject;
+        if (!editObject) {
+          return;
+        }
+        await editObject.call(
+          bound.adapter,
+          bound.threadId,
+          bound.messageId,
+          this.kind,
+          this._model
+        );
+      }
     };
     const chained = bound.updateChain.then(doEdit, doEdit);
     bound.updateChain = chained.then(
