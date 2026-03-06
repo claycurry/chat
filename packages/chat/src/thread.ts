@@ -3,7 +3,8 @@ import type { Root } from "mdast";
 import { cardToFallbackText } from "./cards";
 import { ChannelImpl, deriveChannelId } from "./channel";
 import { getChatSingleton } from "./chat-singleton";
-import { type CardJSXElement, isJSX, toCardElement } from "./jsx-runtime";
+import { fromFullStream } from "./from-full-stream";
+import { type ChatElement, isJSX, toCardElement } from "./jsx-runtime";
 import {
   paragraph,
   parseMarkdown,
@@ -26,6 +27,8 @@ import type {
   PostEphemeralOptions,
   SentMessage,
   StateAdapter,
+  StreamChunk,
+  StreamEvent,
   StreamOptions,
   Thread,
 } from "./types";
@@ -87,9 +90,11 @@ function isLazyConfig(
 const THREAD_STATE_KEY_PREFIX = "thread-state:";
 
 /**
- * Check if a value is an AsyncIterable (like AI SDK's textStream).
+ * Check if a value is an AsyncIterable (like AI SDK's textStream or fullStream).
  */
-function isAsyncIterable(value: unknown): value is AsyncIterable<string> {
+function isAsyncIterable(
+  value: unknown
+): value is AsyncIterable<string | StreamChunk | StreamEvent> {
   return (
     value !== null && typeof value === "object" && Symbol.asyncIterator in value
   );
@@ -335,10 +340,10 @@ export class ThreadImpl<TState = Record<string, unknown>>
       | string
       | AdapterPostableMessage
       | AsyncIterable<string>
-      | CardJSXElement
+      | ChatElement
   ): Promise<SentMessage>;
   async post(
-    message: string | PostableMessage | CardJSXElement
+    message: string | PostableMessage | ChatElement
   ): Promise<SentMessage | PostableObject> {
     if (isPostableObject(message)) {
       await this.handlePostableObject(message);
@@ -402,7 +407,7 @@ export class ThreadImpl<TState = Record<string, unknown>>
 
   async postEphemeral(
     user: string | Author,
-    message: AdapterPostableMessage | CardJSXElement,
+    message: AdapterPostableMessage | ChatElement,
     options: PostEphemeralOptions
   ): Promise<EphemeralMessage | null> {
     const { fallbackToDM } = options;
@@ -449,11 +454,14 @@ export class ThreadImpl<TState = Record<string, unknown>>
 
   /**
    * Handle streaming from an AsyncIterable.
-   * Uses adapter's native streaming if available, otherwise falls back to post+edit.
+   * Normalizes the stream (supports both textStream and fullStream from AI SDK),
+   * then uses adapter's native streaming if available, otherwise falls back to post+edit.
    */
   private async handleStream(
-    textStream: AsyncIterable<string>
+    rawStream: AsyncIterable<string | StreamChunk | StreamEvent>
   ): Promise<SentMessage> {
+    // Normalize: handles plain strings, AI SDK fullStream events, and StreamChunk objects
+    const textStream = fromFullStream(rawStream);
     // Build streaming options from current message context
     const options: StreamOptions = {};
     if (this._currentMessage) {
@@ -468,16 +476,23 @@ export class ThreadImpl<TState = Record<string, unknown>>
 
     // Use native streaming if adapter supports it
     if (this.adapter.stream) {
-      // Wrap stream to collect accumulated text while passing through to adapter
+      // Wrap stream to collect accumulated text while passing through to adapter.
+      // StreamChunk objects are passed through; only plain strings are accumulated.
       let accumulated = "";
-      const wrappedStream: AsyncIterable<string> = {
+      const wrappedStream: AsyncIterable<string | StreamChunk> = {
         [Symbol.asyncIterator]: () => {
           const iterator = textStream[Symbol.asyncIterator]();
           return {
             async next() {
               const result = await iterator.next();
               if (!result.done) {
-                accumulated += result.value;
+                const value = result.value;
+                if (typeof value === "string") {
+                  accumulated += value;
+                } else if (value.type === "markdown_text") {
+                  accumulated += value.text;
+                }
+                // task_update and plan_update chunks don't contribute to accumulated text
               }
               return result;
             },
@@ -493,8 +508,32 @@ export class ThreadImpl<TState = Record<string, unknown>>
       );
     }
 
-    // Fallback: post + edit with throttling
-    return this.fallbackStream(textStream, options);
+    // Fallback: post + edit with throttling.
+    // Extract only text content from the mixed stream for adapters without native streaming.
+    const textOnlyStream: AsyncIterable<string> = {
+      [Symbol.asyncIterator]: () => {
+        const iterator = textStream[Symbol.asyncIterator]();
+        return {
+          async next(): Promise<IteratorResult<string>> {
+            while (true) {
+              const result = await iterator.next();
+              if (result.done) {
+                return { value: undefined as unknown as string, done: true };
+              }
+              const value = result.value;
+              if (typeof value === "string") {
+                return { value, done: false };
+              }
+              if (value.type === "markdown_text") {
+                return { value: value.text, done: false };
+              }
+              // Skip non-text chunks (task_update, plan_update) in fallback mode
+            }
+          },
+        };
+      },
+    };
+    return this.fallbackStream(textOnlyStream, options);
   }
 
   async startTyping(status?: string): Promise<void> {
@@ -734,7 +773,7 @@ export class ThreadImpl<TState = Record<string, unknown>>
       },
 
       async edit(
-        newContent: string | PostableMessage | CardJSXElement
+        newContent: string | PostableMessage | ChatElement
       ): Promise<SentMessage> {
         // Auto-convert JSX elements to CardElement
         // edit doesn't support streaming, so use AdapterPostableMessage
@@ -790,7 +829,7 @@ export class ThreadImpl<TState = Record<string, unknown>>
       },
 
       async edit(
-        newContent: string | PostableMessage | CardJSXElement
+        newContent: string | PostableMessage | ChatElement
       ): Promise<SentMessage> {
         let postable: string | AdapterPostableMessage = newContent as
           | string

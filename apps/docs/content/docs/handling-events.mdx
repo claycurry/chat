@@ -1,6 +1,6 @@
 ---
 title: Handling Events
-description: Register handlers for mentions, messages, reactions, and platform-specific events.
+description: Register handlers for mentions, messages, reactions, member joins, and platform-specific events.
 type: guide
 prerequisites:
   - /docs/getting-started
@@ -373,3 +373,30 @@ The `event` object includes:
 | `userId` | `string` | User who opened the Home tab |
 | `channelId` | `string` | Channel context |
 | `adapter` | `Adapter` | The Slack adapter |
+
+### Handling member joined channel
+
+`onMemberJoinedChannel` fires when a user joins a Slack channel. Use it to post welcome messages or onboard users automatically.
+
+```typescript title="lib/bot.ts" lineNumbers
+bot.onMemberJoinedChannel(async (event) => {
+  // Only post when the bot itself joins
+  if (event.userId !== event.adapter.botUserId) {
+    return;
+  }
+
+  await event.adapter.postMessage(
+    event.channelId,
+    "Hello! I'm now available in this channel. Mention me to get started."
+  );
+});
+```
+
+The `event` object includes:
+
+| Property | Type | Description |
+|----------|------|-------------|
+| `adapter` | `Adapter` | The Slack adapter |
+| `channelId` | `string` | The channel that was joined |
+| `userId` | `string` | The user who joined |
+| `inviterId` | `string` (optional) | The user who invited them |
