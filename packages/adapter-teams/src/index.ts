@@ -127,11 +127,11 @@ export interface TeamsAuthFederated {
 }
 
 export interface TeamsAdapterConfig {
-  /** Microsoft App ID */
-  appId: string;
-  /** Microsoft App Password (client secret auth) */
+  /** Microsoft App ID. Defaults to TEAMS_APP_ID env var. */
+  appId?: string;
+  /** Microsoft App Password. Defaults to TEAMS_APP_PASSWORD env var. */
   appPassword?: string;
-  /** Microsoft App Tenant ID */
+  /** Microsoft App Tenant ID. Defaults to TEAMS_APP_TENANT_ID env var. */
   appTenantId?: string;
   /** Microsoft App Type */
   appType?: "MultiTenant" | "SingleTenant";
@@ -139,8 +139,8 @@ export interface TeamsAdapterConfig {
   certificate?: TeamsAuthCertificate;
   /** Federated (workload identity) authentication */
   federated?: TeamsAuthFederated;
-  /** Logger instance for error reporting */
-  logger: Logger;
+  /** Logger instance for error reporting. Defaults to ConsoleLogger. */
+  logger?: Logger;
   /** Override bot username (optional) */
   userName?: string;
 }
@@ -169,15 +169,35 @@ export class TeamsAdapter implements Adapter<TeamsThreadId, unknown> {
   private chat: ChatInstance | null = null;
   private readonly logger: Logger;
   private readonly formatConverter = new TeamsFormatConverter();
-  private readonly config: TeamsAdapterConfig;
+  private readonly config: Required<Pick<TeamsAdapterConfig, "appId">> &
+    TeamsAdapterConfig;
 
-  constructor(config: TeamsAdapterConfig) {
-    this.config = config;
-    this.logger = config.logger;
+  constructor(config: TeamsAdapterConfig = {}) {
+    const appId = config.appId ?? process.env.TEAMS_APP_ID;
+    if (!appId) {
+      throw new ValidationError(
+        "teams",
+        "appId is required. Set TEAMS_APP_ID or provide it in config."
+      );
+    }
+    const hasExplicitAuth =
+      config.appPassword || config.certificate || config.federated;
+    const appPassword = hasExplicitAuth
+      ? config.appPassword
+      : (config.appPassword ?? process.env.TEAMS_APP_PASSWORD);
+    const appTenantId = config.appTenantId ?? process.env.TEAMS_APP_TENANT_ID;
+
+    this.config = {
+      ...config,
+      appId,
+      appPassword,
+      appTenantId,
+    };
+    this.logger = config.logger ?? new ConsoleLogger("info").child("teams");
     this.userName = config.userName || "bot";
 
     const authMethodCount = [
-      config.appPassword,
+      appPassword,
       config.certificate,
       config.federated,
     ].filter(Boolean).length;
@@ -196,7 +216,7 @@ export class TeamsAdapter implements Adapter<TeamsThreadId, unknown> {
       );
     }
 
-    if (config.appType === "SingleTenant" && !config.appTenantId) {
+    if (config.appType === "SingleTenant" && !appTenantId) {
       throw new ValidationError(
         "teams",
         "appTenantId is required for SingleTenant app type"
@@ -205,10 +225,10 @@ export class TeamsAdapter implements Adapter<TeamsThreadId, unknown> {
 
     // Build Bot Framework auth based on credential type
     const botFrameworkConfig = {
-      MicrosoftAppId: config.appId,
+      MicrosoftAppId: appId,
       MicrosoftAppType: config.appType || "MultiTenant",
       MicrosoftAppTenantId:
-        config.appType === "SingleTenant" ? config.appTenantId : undefined,
+        config.appType === "SingleTenant" ? appTenantId : undefined,
     };
 
     let credentialsFactory:
@@ -223,17 +243,17 @@ export class TeamsAdapter implements Adapter<TeamsThreadId, unknown> {
 
       if (x5c) {
         credentialsFactory = new CertificateServiceClientCredentialsFactory(
-          config.appId,
+          appId,
           x5c,
           certificatePrivateKey,
-          config.appTenantId
+          appTenantId
         );
       } else if (certificateThumbprint) {
         credentialsFactory = new CertificateServiceClientCredentialsFactory(
-          config.appId,
+          appId,
           certificateThumbprint,
           certificatePrivateKey,
-          config.appTenantId
+          appTenantId
         );
       } else {
         throw new ValidationError(
@@ -242,38 +262,34 @@ export class TeamsAdapter implements Adapter<TeamsThreadId, unknown> {
         );
       }
 
-      if (config.appTenantId) {
-        graphCredential = new ClientCertificateCredential(
-          config.appTenantId,
-          config.appId,
-          { certificate: certificatePrivateKey }
-        );
+      if (appTenantId) {
+        graphCredential = new ClientCertificateCredential(appTenantId, appId, {
+          certificate: certificatePrivateKey,
+        });
       }
     } else if (config.federated) {
       credentialsFactory = new FederatedServiceClientCredentialsFactory(
-        config.appId,
+        appId,
         config.federated.clientId,
-        config.appTenantId,
+        appTenantId,
         config.federated.clientAudience
       );
 
-      if (config.appTenantId) {
+      if (appTenantId) {
         graphCredential = new DefaultAzureCredential();
       }
-    } else if (config.appPassword && config.appTenantId) {
+    } else if (appPassword && appTenantId) {
       graphCredential = new ClientSecretCredential(
-        config.appTenantId,
-        config.appId,
-        config.appPassword
+        appTenantId,
+        appId,
+        appPassword
       );
     }
 
     const auth = new ConfigurationBotFrameworkAuthentication(
       {
         ...botFrameworkConfig,
-        ...(config.appPassword
-          ? { MicrosoftAppPassword: config.appPassword }
-          : {}),
+        ...(appPassword ? { MicrosoftAppPassword: appPassword } : {}),
       },
       credentialsFactory
     );
@@ -2479,45 +2495,8 @@ export class TeamsAdapter implements Adapter<TeamsThreadId, unknown> {
   }
 }
 
-export function createTeamsAdapter(
-  config?: Partial<TeamsAdapterConfig>
-): TeamsAdapter {
-  const appId = config?.appId ?? process.env.TEAMS_APP_ID;
-  if (!appId) {
-    throw new ValidationError(
-      "teams",
-      "appId is required. Set TEAMS_APP_ID or provide it in config."
-    );
-  }
-
-  // Resolve auth: explicit config takes precedence, then fall back to env vars
-  const hasExplicitAuth =
-    config?.appPassword || config?.certificate || config?.federated;
-
-  let appPassword: string | undefined;
-  if (hasExplicitAuth) {
-    appPassword = config?.appPassword;
-  } else {
-    appPassword = process.env.TEAMS_APP_PASSWORD;
-    if (!appPassword) {
-      throw new ValidationError(
-        "teams",
-        "Auth is required. Provide appPassword, certificate, or federated in config, or set TEAMS_APP_PASSWORD."
-      );
-    }
-  }
-
-  const resolved: TeamsAdapterConfig = {
-    appId,
-    appPassword,
-    certificate: config?.certificate,
-    federated: config?.federated,
-    appTenantId: config?.appTenantId ?? process.env.TEAMS_APP_TENANT_ID,
-    appType: config?.appType,
-    logger: config?.logger ?? new ConsoleLogger("info").child("teams"),
-    userName: config?.userName,
-  };
-  return new TeamsAdapter(resolved);
+export function createTeamsAdapter(config?: TeamsAdapterConfig): TeamsAdapter {
+  return new TeamsAdapter(config ?? {});
 }
 
 // Re-export card converter for advanced use
