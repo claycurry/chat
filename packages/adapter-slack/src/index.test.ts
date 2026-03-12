@@ -1173,6 +1173,26 @@ function createMockState(): StateAdapter & { cache: Map<string, unknown> } {
       cache.delete(key);
       return Promise.resolve();
     }),
+    appendToList: vi
+      .fn()
+      .mockImplementation(
+        (
+          key: string,
+          value: unknown,
+          options?: { maxLength?: number; ttlMs?: number }
+        ) => {
+          let list = (cache.get(key) as unknown[]) ?? [];
+          list.push(value);
+          if (options?.maxLength && list.length > options.maxLength) {
+            list = list.slice(list.length - options.maxLength);
+          }
+          cache.set(key, list);
+          return Promise.resolve();
+        }
+      ),
+    getList: vi.fn().mockImplementation((key: string) => {
+      return Promise.resolve((cache.get(key) as unknown[]) ?? []);
+    }),
   };
 }
 
@@ -4596,5 +4616,324 @@ describe("isMessageFromSelf", () => {
       adapter as unknown as AdapterWithPrivates
     ).isMessageFromSelf({ user: "U_OTHER" });
     expect(result).toBe(false);
+  });
+});
+
+// ============================================================================
+// Reverse User Lookup — @mention Resolution Tests
+// ============================================================================
+
+describe("reverse user lookup", () => {
+  const secret = "test-signing-secret";
+
+  interface MentionAdapter {
+    chat: ChatInstance | null;
+    resolveMessageMentions(
+      message: AdapterPostableMessage,
+      threadId: string
+    ): Promise<AdapterPostableMessage>;
+    resolveOutgoingMentions(text: string, threadId: string): Promise<string>;
+  }
+
+  function createAdapterWithState() {
+    const state = createMockState();
+    const adapter = createSlackAdapter({
+      botToken: "xoxb-test-token",
+      signingSecret: secret,
+      logger: mockLogger,
+    });
+    const chatInstance = createMockChatInstance(state);
+    (adapter as unknown as MentionAdapter).chat = chatInstance;
+    return { adapter, state };
+  }
+
+  describe("reverse index storage in lookupUser", () => {
+    it("stores reverse index when looking up a user", async () => {
+      const { adapter, state } = createAdapterWithState();
+
+      // Mock Slack API
+      const mockClient = (
+        adapter as unknown as { client: { users: { info: unknown } } }
+      ).client;
+      mockClient.users.info = vi.fn().mockResolvedValue({
+        user: {
+          profile: { display_name: "dominik", real_name: "Dominik G" },
+          real_name: "Dominik G",
+          name: "dominik",
+        },
+      });
+
+      await (
+        adapter as unknown as {
+          lookupUser(
+            userId: string
+          ): Promise<{ displayName: string; realName: string }>;
+        }
+      ).lookupUser("U_DOM_123");
+
+      // Check reverse index was written
+      const userIds = await state.getList("slack:user-by-name:dominik");
+      expect(userIds).toContain("U_DOM_123");
+    });
+  });
+
+  describe("resolveOutgoingMentions", () => {
+    it("resolves unambiguous @mention to <@USER_ID>", async () => {
+      const { adapter, state } = createAdapterWithState();
+
+      // Seed reverse index: "dominik" → ["U_DOM_123"]
+      await state.appendToList("slack:user-by-name:dominik", "U_DOM_123");
+
+      const result = await (
+        adapter as unknown as MentionAdapter
+      ).resolveOutgoingMentions(
+        "Hey @dominik, check this out",
+        "slack:C123:1234567890.123456"
+      );
+
+      expect(result).toBe("Hey <@U_DOM_123>, check this out");
+    });
+
+    it("handles case insensitivity", async () => {
+      const { adapter, state } = createAdapterWithState();
+
+      await state.appendToList("slack:user-by-name:dominik", "U_DOM_123");
+
+      const result = await (
+        adapter as unknown as MentionAdapter
+      ).resolveOutgoingMentions(
+        "Hey @Dominik!",
+        "slack:C123:1234567890.123456"
+      );
+
+      expect(result).toBe("Hey <@U_DOM_123>!");
+    });
+
+    it("deduplicates user IDs from reverse index", async () => {
+      const { adapter, state } = createAdapterWithState();
+
+      // Same user ID appended multiple times (from repeated lookups)
+      await state.appendToList("slack:user-by-name:dominik", "U_DOM_123");
+      await state.appendToList("slack:user-by-name:dominik", "U_DOM_123");
+
+      const result = await (
+        adapter as unknown as MentionAdapter
+      ).resolveOutgoingMentions("Hey @dominik", "slack:C123:1234567890.123456");
+
+      expect(result).toBe("Hey <@U_DOM_123>");
+    });
+
+    it("leaves mention as plain text when no match found", async () => {
+      const { adapter } = createAdapterWithState();
+
+      const result = await (
+        adapter as unknown as MentionAdapter
+      ).resolveOutgoingMentions(
+        "Hey @unknown_user",
+        "slack:C123:1234567890.123456"
+      );
+
+      expect(result).toBe("Hey @unknown_user");
+    });
+
+    it("skips already-resolved <@USER_ID> mentions", async () => {
+      const { adapter, state } = createAdapterWithState();
+
+      await state.appendToList("slack:user-by-name:dominik", "U_DOM_123");
+
+      const result = await (
+        adapter as unknown as MentionAdapter
+      ).resolveOutgoingMentions(
+        "Hey <@U_DOM_123> and @dominik",
+        "slack:C123:1234567890.123456"
+      );
+
+      expect(result).toContain("<@U_DOM_123>");
+      // The second @dominik should also be resolved
+      expect(result).toBe("Hey <@U_DOM_123> and <@U_DOM_123>");
+    });
+
+    it("disambiguates using thread participants", async () => {
+      const { adapter, state } = createAdapterWithState();
+      const threadId = "slack:C123:1234567890.123456";
+
+      // Two users named "alex"
+      await state.appendToList("slack:user-by-name:alex", "U_ALEX_1");
+      await state.appendToList("slack:user-by-name:alex", "U_ALEX_2");
+
+      // Only U_ALEX_2 is a thread participant
+      await state.appendToList(
+        `slack:thread-participants:${threadId}`,
+        "U_ALEX_2"
+      );
+
+      const result = await (
+        adapter as unknown as MentionAdapter
+      ).resolveOutgoingMentions("Hey @alex", threadId);
+
+      expect(result).toBe("Hey <@U_ALEX_2>");
+    });
+
+    it("leaves ambiguous mentions as plain text when thread participants don't help", async () => {
+      const { adapter, state } = createAdapterWithState();
+      const threadId = "slack:C123:1234567890.123456";
+
+      // Two users named "alex"
+      await state.appendToList("slack:user-by-name:alex", "U_ALEX_1");
+      await state.appendToList("slack:user-by-name:alex", "U_ALEX_2");
+
+      // Both are thread participants
+      await state.appendToList(
+        `slack:thread-participants:${threadId}`,
+        "U_ALEX_1"
+      );
+      await state.appendToList(
+        `slack:thread-participants:${threadId}`,
+        "U_ALEX_2"
+      );
+
+      const result = await (
+        adapter as unknown as MentionAdapter
+      ).resolveOutgoingMentions("Hey @alex", threadId);
+
+      expect(result).toBe("Hey @alex");
+    });
+
+    it("resolves multiple different mentions in one message", async () => {
+      const { adapter, state } = createAdapterWithState();
+
+      await state.appendToList("slack:user-by-name:dominik", "U_DOM_123");
+      await state.appendToList("slack:user-by-name:malte", "U_MAL_456");
+
+      const result = await (
+        adapter as unknown as MentionAdapter
+      ).resolveOutgoingMentions(
+        "@dominik and @malte please review",
+        "slack:C123:1234567890.123456"
+      );
+
+      expect(result).toBe("<@U_DOM_123> and <@U_MAL_456> please review");
+    });
+
+    it("does nothing when chat is not initialized", async () => {
+      const adapter = createSlackAdapter({
+        botToken: "xoxb-test-token",
+        signingSecret: secret,
+        logger: mockLogger,
+      });
+
+      const result = await (
+        adapter as unknown as MentionAdapter
+      ).resolveOutgoingMentions("Hey @dominik", "slack:C123:1234567890.123456");
+
+      expect(result).toBe("Hey @dominik");
+    });
+  });
+
+  describe("resolveMessageMentions", () => {
+    it("resolves mentions in string messages", async () => {
+      const { adapter, state } = createAdapterWithState();
+
+      await state.appendToList("slack:user-by-name:dominik", "U_DOM_123");
+
+      const result = await (
+        adapter as unknown as MentionAdapter
+      ).resolveMessageMentions(
+        "Hey @dominik" as AdapterPostableMessage,
+        "slack:C123:1234567890.123456"
+      );
+
+      expect(result).toBe("Hey <@U_DOM_123>");
+    });
+
+    it("resolves mentions in raw messages", async () => {
+      const { adapter, state } = createAdapterWithState();
+
+      await state.appendToList("slack:user-by-name:dominik", "U_DOM_123");
+
+      const result = await (
+        adapter as unknown as MentionAdapter
+      ).resolveMessageMentions(
+        { raw: "Hey @dominik" } as AdapterPostableMessage,
+        "slack:C123:1234567890.123456"
+      );
+
+      expect(result).toEqual({ raw: "Hey <@U_DOM_123>" });
+    });
+
+    it("resolves mentions in markdown messages", async () => {
+      const { adapter, state } = createAdapterWithState();
+
+      await state.appendToList("slack:user-by-name:dominik", "U_DOM_123");
+
+      const result = await (
+        adapter as unknown as MentionAdapter
+      ).resolveMessageMentions(
+        { markdown: "Hey @dominik" } as AdapterPostableMessage,
+        "slack:C123:1234567890.123456"
+      );
+
+      expect(result).toEqual({ markdown: "Hey <@U_DOM_123>" });
+    });
+
+    it("passes through AST messages unchanged", async () => {
+      const { adapter } = createAdapterWithState();
+
+      const astMessage = {
+        ast: { type: "root", children: [] },
+      } as AdapterPostableMessage;
+
+      const result = await (
+        adapter as unknown as MentionAdapter
+      ).resolveMessageMentions(astMessage, "slack:C123:1234567890.123456");
+
+      expect(result).toBe(astMessage);
+    });
+  });
+
+  describe("thread participant tracking", () => {
+    it("tracks thread participants on incoming messages", async () => {
+      const { adapter, state } = createAdapterWithState();
+
+      // Mock Slack API so lookupUser doesn't hit real API
+      const mockClient = (
+        adapter as unknown as { client: { users: { info: unknown } } }
+      ).client;
+      mockClient.users.info = vi.fn().mockResolvedValue({
+        user: {
+          profile: { display_name: "sender", real_name: "Sender One" },
+          real_name: "Sender One",
+          name: "sender",
+        },
+      });
+
+      const threadId = "slack:C123:1234567890.123456";
+      const event = {
+        type: "message",
+        user: "U_SENDER_1",
+        text: "Hello",
+        ts: "1234567890.123456",
+        channel: "C123",
+        thread_ts: "1234567890.123456",
+      };
+
+      // Call parseSlackMessage directly
+      await (
+        adapter as unknown as {
+          parseSlackMessage(
+            event: Record<string, unknown>,
+            threadId: string
+          ): Promise<unknown>;
+        }
+      ).parseSlackMessage(event, threadId);
+
+      // Wait for fire-and-forget to complete
+      await new Promise((resolve) => setTimeout(resolve, 10));
+
+      const participants = await state.getList(
+        `slack:thread-participants:${threadId}`
+      );
+      expect(participants).toContain("U_SENDER_1");
+    });
   });
 });

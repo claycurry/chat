@@ -67,6 +67,7 @@ import {
 } from "./modals";
 
 const SLACK_USER_ID_PATTERN = /^[A-Z0-9_]+$/;
+const SLACK_USER_ID_EXACT_PATTERN = /^U[A-Z0-9]+$/;
 
 /** Find the next `<@` or `<#` mention in text. */
 function findNextMention(text: string): number {
@@ -357,8 +358,9 @@ export class SlackAdapter implements Adapter<SlackThreadId, unknown> {
   private _botUserId: string | null = null;
   private _botId: string | null = null; // Bot app ID (B_xxx) - different from user ID
   private readonly formatConverter = new SlackFormatConverter();
-  private static USER_CACHE_TTL_MS = 60 * 60 * 1000; // 1 hour
-  private static CHANNEL_CACHE_TTL_MS = 60 * 60 * 1000; // 1 hour
+  private static USER_CACHE_TTL_MS = 8 * 24 * 60 * 60 * 1000; // 8 days
+  private static CHANNEL_CACHE_TTL_MS = 8 * 24 * 60 * 60 * 1000; // 8 days
+  private static REVERSE_INDEX_TTL_MS = 8 * 24 * 60 * 60 * 1000; // 8 days
 
   // Multi-workspace support
   private readonly clientId: string | undefined;
@@ -725,6 +727,17 @@ export class SlackAdapter implements Adapter<SlackThreadId, unknown> {
             { displayName, realName },
             SlackAdapter.USER_CACHE_TTL_MS
           );
+
+        // Build reverse index: display name → user IDs (skip if already present)
+        const normalizedName = displayName.toLowerCase();
+        const reverseKey = `slack:user-by-name:${normalizedName}`;
+        const existing = await this.chat.getState().getList<string>(reverseKey);
+        if (!existing.includes(userId)) {
+          await this.chat.getState().appendToList(reverseKey, userId, {
+            maxLength: 50,
+            ttlMs: SlackAdapter.REVERSE_INDEX_TTL_MS,
+          });
+        }
       }
 
       this.logger.debug("Fetched user info", {
@@ -1833,6 +1846,28 @@ export class SlackAdapter implements Adapter<SlackThreadId, unknown> {
       fullName = userInfo.realName;
     }
 
+    // Track thread participants for outgoing mention resolution (skip dupes)
+    if (event.user && this.chat) {
+      try {
+        const participantKey = `slack:thread-participants:${threadId}`;
+        const participants = await this.chat
+          .getState()
+          .getList<string>(participantKey);
+        if (!participants.includes(event.user)) {
+          await this.chat.getState().appendToList(participantKey, event.user, {
+            maxLength: 100,
+            ttlMs: SlackAdapter.REVERSE_INDEX_TTL_MS,
+          });
+        }
+      } catch (error) {
+        this.logger.warn("Failed to track thread participant", {
+          threadId,
+          userId: event.user,
+          error,
+        });
+      }
+    }
+
     // Resolve inline @mentions to display names
     const text = await this.resolveInlineMentions(rawText, skipSelfMention);
 
@@ -1928,6 +1963,136 @@ export class SlackAdapter implements Adapter<SlackThreadId, unknown> {
   }
 
   /**
+   * Resolve @name mentions in text to Slack <@USER_ID> format using the
+   * reverse user cache. When multiple users share a display name, prefers
+   * the one who is a participant in the given thread.
+   */
+  private async resolveOutgoingMentions(
+    text: string,
+    threadId: string
+  ): Promise<string> {
+    if (!this.chat) {
+      return text;
+    }
+    const state = this.chat.getState();
+
+    // Find all @word patterns that aren't already wrapped in <@...>
+    const mentionPattern = /@(\w+)/g;
+    const mentions = new Map<string, string[]>();
+
+    for (const match of text.matchAll(mentionPattern)) {
+      const name = match[1];
+      // Skip if already a Slack user ID format or inside <@...>
+      if (SLACK_USER_ID_EXACT_PATTERN.test(name)) {
+        continue;
+      }
+      // Check the character before @ to skip <@...> patterns
+      const idx = match.index;
+      if (idx > 0 && text[idx - 1] === "<") {
+        continue;
+      }
+      if (!mentions.has(name.toLowerCase())) {
+        mentions.set(name.toLowerCase(), []);
+      }
+    }
+
+    if (mentions.size === 0) {
+      return text;
+    }
+
+    // Look up user IDs for each mentioned name
+    for (const name of mentions.keys()) {
+      const userIds = await state.getList<string>(`slack:user-by-name:${name}`);
+      // Dedup
+      const unique = [...new Set(userIds)];
+      mentions.set(name, unique);
+    }
+
+    // Load thread participants only if needed (ambiguous mentions)
+    let participants: Set<string> | null = null;
+    const needsParticipants = [...mentions.values()].some(
+      (ids) => ids.length > 1
+    );
+    if (needsParticipants) {
+      const participantList = await state.getList<string>(
+        `slack:thread-participants:${threadId}`
+      );
+      participants = new Set(participantList);
+    }
+
+    // Replace mentions in text
+    return text.replace(mentionPattern, (match, name: string) => {
+      const idx = text.indexOf(match);
+      if (idx > 0 && text[idx - 1] === "<") {
+        return match;
+      }
+      if (SLACK_USER_ID_EXACT_PATTERN.test(name)) {
+        return match;
+      }
+
+      const userIds = mentions.get(name.toLowerCase());
+      if (!userIds || userIds.length === 0) {
+        return match;
+      }
+      if (userIds.length === 1) {
+        return `<@${userIds[0]}>`;
+      }
+      // Disambiguate using thread participants
+      if (participants) {
+        const inThread = userIds.filter((id) => participants.has(id));
+        if (inThread.length === 1) {
+          return `<@${inThread[0]}>`;
+        }
+      }
+      // Still ambiguous — leave as plain text
+      return match;
+    });
+  }
+
+  /**
+   * Pre-process an outgoing message to resolve @name mentions before rendering.
+   */
+  private async resolveMessageMentions(
+    message: AdapterPostableMessage,
+    threadId: string
+  ): Promise<AdapterPostableMessage> {
+    if (!this.chat) {
+      return message;
+    }
+    if (typeof message === "string") {
+      return this.resolveOutgoingMentions(message, threadId);
+    }
+    if (typeof message === "object" && message !== null) {
+      if (
+        "raw" in message &&
+        typeof (message as { raw: unknown }).raw === "string"
+      ) {
+        return {
+          ...message,
+          raw: await this.resolveOutgoingMentions(
+            (message as { raw: string }).raw,
+            threadId
+          ),
+        };
+      }
+      if (
+        "markdown" in message &&
+        typeof (message as { markdown: unknown }).markdown === "string"
+      ) {
+        return {
+          ...message,
+          markdown: await this.resolveOutgoingMentions(
+            (message as { markdown: string }).markdown,
+            threadId
+          ),
+        };
+      }
+    }
+    // AST, Card, or other formats — pass through unchanged
+    return message;
+  }
+
+  /**
    * Try to render a message using native Slack table blocks.
    * Returns blocks + fallback text if the message contains tables, null otherwise.
    */
@@ -1961,8 +2126,9 @@ export class SlackAdapter implements Adapter<SlackThreadId, unknown> {
 
   async postMessage(
     threadId: string,
-    message: AdapterPostableMessage
+    _message: AdapterPostableMessage
   ): Promise<RawMessage<unknown>> {
+    const message = await this.resolveMessageMentions(_message, threadId);
     const { channel, threadTs } = this.decodeThreadId(threadId);
 
     try {
@@ -2101,8 +2267,9 @@ export class SlackAdapter implements Adapter<SlackThreadId, unknown> {
   async postEphemeral(
     threadId: string,
     userId: string,
-    message: AdapterPostableMessage
+    _message: AdapterPostableMessage
   ): Promise<EphemeralMessage> {
+    const message = await this.resolveMessageMentions(_message, threadId);
     const { channel, threadTs } = this.decodeThreadId(threadId);
 
     try {
@@ -2217,9 +2384,10 @@ export class SlackAdapter implements Adapter<SlackThreadId, unknown> {
 
   async scheduleMessage(
     threadId: string,
-    message: AdapterPostableMessage,
+    _message: AdapterPostableMessage,
     options: { postAt: Date }
   ): Promise<ScheduledMessage> {
+    const message = await this.resolveMessageMentions(_message, threadId);
     const { channel, threadTs } = this.decodeThreadId(threadId);
     const postAtUnix = Math.floor(options.postAt.getTime() / 1000);
 
@@ -2454,8 +2622,9 @@ export class SlackAdapter implements Adapter<SlackThreadId, unknown> {
   async editMessage(
     threadId: string,
     messageId: string,
-    message: AdapterPostableMessage
+    _message: AdapterPostableMessage
   ): Promise<RawMessage<unknown>> {
+    const message = await this.resolveMessageMentions(_message, threadId);
     const ephemeral = this.decodeEphemeralMessageId(messageId);
     if (ephemeral) {
       const { threadTs } = this.decodeThreadId(threadId);
