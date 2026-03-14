@@ -1,14 +1,13 @@
----
-title: Linq
-description: Configure the Linq adapter for iMessage, SMS, and RCS messaging via the Linq API.
-type: integration
-prerequisites:
-  - /docs/getting-started
----
+# @chat-adapter/linq
+
+[![npm version](https://img.shields.io/npm/v/@chat-adapter/linq)](https://www.npmjs.com/package/@chat-adapter/linq)
+[![npm downloads](https://img.shields.io/npm/dm/@chat-adapter/linq)](https://www.npmjs.com/package/@chat-adapter/linq)
+
+Linq adapter for [Chat SDK](https://chat-sdk.dev), supporting iMessage, SMS, and RCS messaging via the Linq Partner API.
 
 ## Installation
 
-```sh title="Terminal"
+```bash
 pnpm add @chat-adapter/linq
 ```
 
@@ -16,7 +15,7 @@ pnpm add @chat-adapter/linq
 
 The adapter auto-detects `LINQ_API_TOKEN`, `LINQ_SIGNING_SECRET`, and `LINQ_PHONE_NUMBER` from environment variables:
 
-```typescript title="lib/bot.ts" lineNumbers
+```typescript
 import { Chat } from "chat";
 import { createLinqAdapter } from "@chat-adapter/linq";
 
@@ -34,7 +33,8 @@ bot.onNewMention(async (thread, message) => {
 
 ## Webhook route
 
-```typescript title="app/api/webhooks/linq/route.ts" lineNumbers
+```typescript
+// app/api/webhooks/linq/route.ts
 import { bot } from "@/lib/bot";
 
 export async function POST(request: Request): Promise<Response> {
@@ -60,7 +60,7 @@ All options are auto-detected from environment variables when not provided.
 
 ## Environment variables
 
-```bash title=".env.local"
+```bash
 LINQ_API_TOKEN=...
 LINQ_SIGNING_SECRET=...      # Optional, for webhook signature verification
 LINQ_PHONE_NUMBER=...        # Required for openDM and listThreads
