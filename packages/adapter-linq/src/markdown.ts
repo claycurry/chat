@@ -49,6 +49,10 @@ export class LinqFormatConverter extends BaseFormatConverter {
   private stripMarkdown(markdown: string): string {
     return (
       markdown
+        // Fenced code blocks (remove backtick fences, keep content)
+        .replace(/```[\s\S]*?```/g, (match) =>
+          match.replace(/```\w*\n?/g, "").trim()
+        )
         // Bold
         .replace(/\*\*(.+?)\*\*/g, "$1")
         // Italic
@@ -58,10 +62,16 @@ export class LinqFormatConverter extends BaseFormatConverter {
         .replace(/~~(.+?)~~/g, "$1")
         // Inline code
         .replace(/`(.+?)`/g, "$1")
+        // Images
+        .replace(/!\[([^\]]*)\]\([^)]+\)/g, "$1")
         // Links
         .replace(/\[(.+?)\]\((.+?)\)/g, "$1 ($2)")
         // Headers
         .replace(/^#{1,6}\s+(.+)$/gm, "$1")
+        // Blockquotes
+        .replace(/^>\s?/gm, "")
+        // Horizontal rules
+        .replace(/^[-*_]{3,}\s*$/gm, "")
         .trim()
     );
   }

@@ -780,7 +780,48 @@ describe("webhook edge cases", () => {
     const reactionCall = (mockChat.processReaction as ReturnType<typeof vi.fn>)
       .mock.calls[0][0];
     expect(reactionCall.added).toBe(false);
-    expect(reactionCall.emoji.name).toBe("thumbsup");
+    expect(reactionCall.emoji.name).toBe("thumbs_up");
+  });
+
+  it("skips outbound message events", async () => {
+    const adapter = new LinqAdapter({
+      apiToken: "test-token",
+      logger: mockLogger,
+    });
+    const mockChat = createMockChat();
+    await adapter.initialize(mockChat);
+
+    const body = JSON.stringify({
+      api_version: "v3",
+      webhook_version: "2026-02-03",
+      event_type: "message.sent",
+      event_id: "evt-out-1",
+      created_at: new Date().toISOString(),
+      trace_id: "trace-out",
+      partner_id: "partner-1",
+      data: {
+        chat: { id: "chat-123" },
+        id: "msg-out",
+        direction: "outbound",
+        sender_handle: {
+          id: "h1",
+          handle: "+15551234567",
+          service: "iMessage",
+          joined_at: "2025-01-01T00:00:00Z",
+        },
+        parts: [{ type: "text", value: "Sent by bot" }],
+        service: "iMessage",
+      },
+    });
+
+    const request = new Request("https://example.com/webhook", {
+      method: "POST",
+      body,
+    });
+
+    const response = await adapter.handleWebhook(request);
+    expect(response.status).toBe(200);
+    expect(mockChat.processMessage).not.toHaveBeenCalled();
   });
 
   it("routes message.edited events", async () => {

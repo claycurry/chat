@@ -26,7 +26,7 @@ import type {
   ThreadInfo,
   WebhookOptions,
 } from "chat";
-import { ConsoleLogger, Message } from "chat";
+import { ConsoleLogger, getEmoji, Message } from "chat";
 import createClient from "openapi-fetch";
 import { LinqFormatConverter } from "./markdown";
 import type { components, paths } from "./schema";
@@ -49,18 +49,18 @@ const WEBHOOK_TIMESTAMP_TOLERANCE_SECONDS = 300;
 
 const LINQ_REACTION_MAP: Record<string, string> = {
   love: "heart",
-  like: "thumbsup",
-  dislike: "thumbsdown",
-  laugh: "laughing",
+  like: "thumbs_up",
+  dislike: "thumbs_down",
+  laugh: "laugh",
   emphasize: "exclamation",
   question: "question",
 };
 
 const EMOJI_TO_LINQ_REACTION: Record<string, string> = {
   heart: "love",
-  thumbsup: "like",
-  thumbsdown: "dislike",
-  laughing: "laugh",
+  thumbs_up: "like",
+  thumbs_down: "dislike",
+  laugh: "laugh",
   exclamation: "emphasize",
   question: "question",
 };
@@ -635,6 +635,11 @@ export class LinqAdapter implements Adapter<LinqThreadId, LinqRawMessage> {
     }
 
     const eventData = payload.data as LinqMessageEventV2;
+
+    if (eventData.direction === "outbound") {
+      return;
+    }
+
     const chatId = eventData.chat?.id;
     if (!chatId) {
       this.logger.warn("Linq message webhook missing chat ID");
@@ -668,7 +673,7 @@ export class LinqAdapter implements Adapter<LinqThreadId, LinqRawMessage> {
     const messageId = data.message_id ?? "";
 
     const reactionType = data.reaction_type ?? "like";
-    const emoji = LINQ_REACTION_MAP[reactionType] ?? reactionType;
+    const emojiName = LINQ_REACTION_MAP[reactionType] ?? reactionType;
 
     const handle = data.from_handle?.handle ?? data.from ?? "unknown";
 
@@ -677,7 +682,7 @@ export class LinqAdapter implements Adapter<LinqThreadId, LinqRawMessage> {
         adapter: this,
         threadId,
         messageId,
-        emoji: { name: emoji, toString: () => emoji, toJSON: () => emoji },
+        emoji: getEmoji(emojiName),
         rawEmoji: data.custom_emoji ?? reactionType,
         added,
         user: {

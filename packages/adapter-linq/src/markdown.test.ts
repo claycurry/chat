@@ -94,6 +94,29 @@ describe("LinqFormatConverter", () => {
       const result = converter.fromAst(ast);
       expect(result).toContain("quoted text");
     });
+
+    it("strips image markdown to alt text", () => {
+      const ast = parseMarkdown("![alt text](https://example.com/img.png)");
+      const result = converter.fromAst(ast);
+      expect(result).toContain("alt text");
+      expect(result).not.toContain("![");
+    });
+
+    it("strips horizontal rules", () => {
+      const ast = parseMarkdown("above\n\n---\n\nbelow");
+      const result = converter.fromAst(ast);
+      expect(result).toContain("above");
+      expect(result).toContain("below");
+      expect(result).not.toMatch(/^---$/m);
+    });
+
+    it("strips blockquote prefixes", () => {
+      const ast = parseMarkdown("> line one\n> line two");
+      const result = converter.fromAst(ast);
+      expect(result).not.toContain(">");
+      expect(result).toContain("line one");
+      expect(result).toContain("line two");
+    });
   });
 
   describe("toAst", () => {
