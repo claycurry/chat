@@ -80,6 +80,16 @@
     "readme": "https://github.com/vercel/chat/tree/main/packages/adapter-whatsapp"
   },
   {
+    "name": "Linq",
+    "slug": "linq",
+    "type": "platform",
+    "icon": "linq",
+    "description": "Connect to iMessage, SMS, and RCS via the Linq API for rich messaging experiences.",
+    "packageName": "@chat-adapter/linq",
+    "beta": true,
+    "readme": "https://github.com/vercel/chat/tree/main/packages/adapter-linq"
+  },
+  {
     "name": "Redis",
     "slug": "redis",
     "type": "state",

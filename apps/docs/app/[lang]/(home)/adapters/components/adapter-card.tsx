@@ -4,7 +4,7 @@ import {
   SiSignal,
   SiX,
 } from "@icons-pack/react-simple-icons";
-import { ExternalLinkIcon, VerifiedIcon } from "lucide-react";
+import { ExternalLinkIcon, MessageCircleIcon, VerifiedIcon } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import {
   Card,
@@ -45,6 +45,7 @@ const iconMap: Record<
   postgres,
   memory,
   whatsapp,
+  linq: MessageCircleIcon,
   instagram: SiInstagram,
   signal: SiSignal,
   x: SiX,
