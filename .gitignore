@@ -4,6 +4,7 @@ node_modules/
 # Build outputs
 dist/
 .turbo/
+packages/chat/docs
 
 # IDE
 .idea/
@@ -41,4 +42,5 @@ todo/
 next-env.d.ts
 .source
 
-packages/chat/docs
+# Certificates
+*.pem
