@@ -1,5 +1,7 @@
 # Chat SDK
 
+noop
+
 [![npm version](https://img.shields.io/npm/v/chat)](https://www.npmjs.com/package/chat)
 [![npm downloads](https://img.shields.io/npm/dm/chat)](https://www.npmjs.com/package/chat)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
