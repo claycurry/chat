@@ -515,7 +515,7 @@ export function createXAdapter(config?: {
     );
   }
 
-  const userName = config?.userName ?? process.env.X_BOT_USERNAME ?? "x-bot";
+  const userName = config?.userName ?? process.env.X_BOT_USERNAME ?? "chatsdk-bot";
 
   return new XAdapter({
     apiKey,
