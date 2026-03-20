@@ -26,6 +26,7 @@ export function buildAdapters(): Adapters {
   // Discord adapter (optional) - env vars: DISCORD_BOT_TOKEN, DISCORD_PUBLIC_KEY, DISCORD_APPLICATION_ID
   if (process.env.DISCORD_BOT_TOKEN && process.env.DISCORD_PUBLIC_KEY) {
     adapters.discord = createDiscordAdapter({
+      userName: "ChatSDK - Discord Client",
       botToken: process.env.DISCORD_BOT_TOKEN,
       publicKey: process.env.DISCORD_PUBLIC_KEY,
       logger,
@@ -39,7 +40,8 @@ export function buildAdapters(): Adapters {
   if (process.env.GITHUB_TOKEN) {
     try {
       adapters.github = createGitHubAdapter({
-              token: process.env.GITHUB_TOKEN!,
+              userName: process.env.GITHUB_BOT_USERNAME ?? "chatsdk-gh",
+              token: process.env.GITHUB_TOKEN,
       webhookSecret: process.env.GITHUB_WEBHOOK_SECRET,
       logger,
       });
