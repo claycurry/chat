@@ -2,30 +2,62 @@ import { Chat, ConsoleLogger, emoji } from "chat";
 import { createRedisState } from "@chat-adapter/state-redis";
 import { createMemoryState } from "@chat-adapter/state-memory";
 import { Octokit } from "@octokit/rest";
-import { buildAdapters } from "./adapters";
+import {
+  createDiscordAdapter,
+} from "@chat-adapter/discord";
+import { createGitHubAdapter } from "@chat-adapter/github";
 
 const octokit = new Octokit({ auth: process.env.GITHUB_TOKEN });
 
 const logger = new ConsoleLogger("debug");
 
-const adapters = buildAdapters();
-
 const state = process.env.REDIS_URL
   ? createRedisState({ url: process.env.REDIS_URL })
   : createMemoryState();
 
+const adapters: Record<string, unknown> = {};
+
+if (process.env.DISCORD_BOT_TOKEN && process.env.DISCORD_PUBLIC_KEY) {
+  try {
+    adapters.discord = createDiscordAdapter({
+      userName: "ChatSDK - Discord Client",
+      botToken: process.env.DISCORD_BOT_TOKEN,
+      publicKey: process.env.DISCORD_PUBLIC_KEY,
+      logger,
+    });
+    console.info("[chat] Discord adapter initialized");
+  } catch {
+    console.warn("[chat] Failed to create Discord adapter");
+  }
+}
+
+if (process.env.GITHUB_APP_ID && process.env.GITHUB_PRIVATE_KEY) {
+  try {
+    adapters.github = createGitHubAdapter({
+      appId: process.env.GITHUB_APP_ID,
+      privateKey: process.env.GITHUB_PRIVATE_KEY,
+      installationId: parseInt(process.env.GITHUB_INSTALLATION_ID!),
+      userName: process.env.GITHUB_BOT_USERNAME ?? "my-bot",
+      webhookSecret: process.env.GITHUB_WEBHOOK_SECRET,
+      logger,
+    });
+    console.info("[chat] GitHub adapter initialized");
+  } catch {
+    console.warn("[chat] Failed to create GitHub adapter");
+  }
+}
+
 export const bot = new Chat({
-  userName: process.env.BOT_USERNAME || "bot_username",
+  userName: process.env.BOT_USERNAME || "my-bot",
   adapters,
   state,
   logger: "debug",
 });
 
-
 bot.onNewMention(async (thread, message) => {
-  console.log(`'${ process.env.BOT_USERNAME }' was mentioned`)
+  console.log(`'${process.env.BOT_USERNAME}' was mentioned`)
   await thread.adapter.addReaction(thread.id, message.id, emoji.eyes);
-  console.log(`'${ process.env.BOT_USERNAME }' reacted`)
+  console.log(`'${process.env.BOT_USERNAME}' reacted`)
   await thread.post("Starting code review...");
 });
 
