@@ -269,17 +269,32 @@ export class GitHubAdapter
   async initialize(chat: ChatInstance): Promise<void> {
     this.chat = chat;
 
-    // Fetch bot user ID if not provided (only works for single-tenant or PAT mode)
+    // Fetch bot user ID if not provided
     if (!this._botUserId && this.octokit) {
       try {
+        // Try PAT-style auth first (GET /user)
         const { data: user } = await this.octokit.users.getAuthenticated();
         this._botUserId = user.id;
         this.logger.info("GitHub auth completed", {
           botUserId: this._botUserId,
           login: user.login,
         });
-      } catch (error) {
-        this.logger.warn("Could not fetch bot user ID", { error });
+      } catch {
+        // PAT auth failed — try GitHub App auth (GET /app → lookup bot user)
+        try {
+          const { data: app } = await this.octokit.apps.getAuthenticated();
+          const botLogin = `${app!.slug}[bot]`;
+          const { data: botUser } = await this.octokit.users.getByUsername({
+            username: botLogin,
+          });
+          this._botUserId = botUser.id;
+          this.logger.info("GitHub App auth completed", {
+            botUserId: this._botUserId,
+            login: botLogin,
+          });
+        } catch (error) {
+          this.logger.warn("Could not fetch bot user ID", { error });
+        }
       }
     }
   }
