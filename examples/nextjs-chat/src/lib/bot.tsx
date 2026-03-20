@@ -48,7 +48,7 @@ if (process.env.GITHUB_APP_ID && process.env.GITHUB_PRIVATE_KEY) {
 }
 
 export const bot = new Chat({
-  userName: process.env.BOT_USERNAME || "my-bot",
+  userName: process.env.BOT_USERNAME || "chatsdk-bot",
   adapters,
   state,
   logger: "debug",
