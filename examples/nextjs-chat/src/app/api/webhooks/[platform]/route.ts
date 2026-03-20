@@ -1,6 +1,5 @@
 import { after } from "next/server";
 import { bot } from "@/lib/bot";
-import { recorder } from "@/lib/recorder";
 
 type Platform = keyof typeof bot.webhooks;
 
@@ -14,11 +13,6 @@ export async function POST(
   const webhookHandler = bot.webhooks[platform as Platform];
   if (!webhookHandler) {
     return new Response(`Unknown platform: ${platform}`, { status: 404 });
-  }
-
-  // Record webhook if enabled (no-op if disabled)
-  if (recorder.isEnabled) {
-    await recorder.recordWebhook(platform, request.clone());
   }
 
   // Handle the webhook with waitUntil for background processing
