@@ -1,4 +1,36 @@
-/** @jsxImportSource chat */
+import { Chat, ConsoleLogger, emoji } from "chat";
+import { createRedisState } from "@chat-adapter/state-redis";
+import { createMemoryState } from "@chat-adapter/state-memory";
+import { Octokit } from "@octokit/rest";
+import { buildAdapters } from "./adapters";
+
+const octokit = new Octokit({ auth: process.env.GITHUB_TOKEN });
+
+const logger = new ConsoleLogger("debug");
+
+const adapters = buildAdapters();
+
+const state = process.env.REDIS_URL
+  ? createRedisState({ url: process.env.REDIS_URL })
+  : createMemoryState();
+
+export const bot = new Chat({
+  userName: process.env.BOT_USERNAME || "bot_username",
+  adapters,
+  state,
+  logger: "debug",
+});
+
+
+bot.onNewMention(async (thread, message) => {
+  console.log(`'${ process.env.BOT_USERNAME }' was mentioned`)
+  await thread.adapter.addReaction(thread.id, message.id, emoji.eyes);
+  console.log(`'${ process.env.BOT_USERNAME }' reacted`)
+  await thread.post("Starting code review...");
+});
+
+
+/** @jsxImportSource chat * /
 import { createMemoryState } from "@chat-adapter/state-memory";
 import { createRedisState } from "@chat-adapter/state-redis";
 import { ToolLoopAgent } from "ai";
@@ -840,3 +872,4 @@ bot.onReaction(["thumbs_up", "heart", "fire", "rocket"], async (event) => {
     emoji.raised_hands
   );
 });
+*/

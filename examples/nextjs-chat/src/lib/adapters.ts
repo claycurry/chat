@@ -2,16 +2,7 @@ import {
   createDiscordAdapter,
   type DiscordAdapter,
 } from "@chat-adapter/discord";
-import {
-  createGoogleChatAdapter,
-  type GoogleChatAdapter,
-} from "@chat-adapter/gchat";
 import { createGitHubAdapter, type GitHubAdapter } from "@chat-adapter/github";
-import { type LinearAdapter } from "@chat-adapter/linear";
-import { createSlackAdapter, type SlackAdapter } from "@chat-adapter/slack";
-import { createTeamsAdapter, type TeamsAdapter } from "@chat-adapter/teams";
-import { type TelegramAdapter } from "@chat-adapter/telegram";
-import { type WhatsAppAdapter } from "@chat-adapter/whatsapp";
 import { ConsoleLogger } from "chat";
 
 // Create a shared logger for adapters that need explicit logger overrides
@@ -19,13 +10,7 @@ const logger = new ConsoleLogger("debug");
 
 export interface Adapters {
   discord?: DiscordAdapter;
-  gchat?: GoogleChatAdapter;
   github?: GitHubAdapter;
-  linear?: LinearAdapter;
-  slack?: SlackAdapter;
-  teams?: TeamsAdapter;
-  telegram?: TelegramAdapter;
-  whatsapp?: WhatsAppAdapter;
 }
 
 /**
@@ -39,14 +24,36 @@ export function buildAdapters(): Adapters {
   const adapters: Adapters = {};
 
   // Discord adapter (optional) - env vars: DISCORD_BOT_TOKEN, DISCORD_PUBLIC_KEY, DISCORD_APPLICATION_ID
-  if (process.env.DISCORD_BOT_TOKEN) {
+  if (process.env.DISCORD_BOT_TOKEN && process.env.DISCORD_PUBLIC_KEY) {
     adapters.discord = createDiscordAdapter({
-      userName: "Chat SDK Bot",
-      logger: logger.child("discord"),
+      botToken: process.env.DISCORD_BOT_TOKEN,
+      publicKey: process.env.DISCORD_PUBLIC_KEY,
+      logger,
     });
     console.info("[chat] Discord adapter initialized")
+  } else {
+    console.warn("[chat] Discord adapter skipped: DISCORD_BOT_TOKEN or DISCORD_PUBLIC_KEY not set");
   }
 
+  // GitHub adapter (optional) - env vars: GITHUB_TOKEN + (GITHUB_TOKEN or GITHUB_APP_ID/PRIVATE_KEY)
+  if (process.env.GITHUB_TOKEN) {
+    try {
+      adapters.github = createGitHubAdapter({
+              token: process.env.GITHUB_TOKEN!,
+      webhookSecret: process.env.GITHUB_WEBHOOK_SECRET,
+      logger,
+      });
+
+      console.info("[chat] GitHub adapter initialized")
+    } catch {
+      console.warn(
+        "[chat] Failed to create github adapter (check GITHUB_TOKEN or GITHUB_APP_ID/PRIVATE_KEY)"
+      );
+    }
+  } else {
+    console.warn("[chat] GitHub adapter skipped: GITHUB_TOKEN not set");
+  }
+/*
   // Slack adapter (optional) - env vars: SLACK_SIGNING_SECRET + (SLACK_BOT_TOKEN or SLACK_CLIENT_ID/SECRET)
   if (process.env.SLACK_SIGNING_SECRET) {
     adapters.slack = createSlackAdapter({
@@ -82,22 +89,8 @@ export function buildAdapters(): Adapters {
       );
     }
   }
-
-  // GitHub adapter (optional) - env vars: GITHUB_WEBHOOK_SECRET + (GITHUB_TOKEN or GITHUB_APP_ID/PRIVATE_KEY)
-  if (process.env.GITHUB_WEBHOOK_SECRET) {
-    try {
-      adapters.github = createGitHubAdapter({
-        logger: logger.child("github"),
-        userName: "chat-sdk-bot",
-      });
-
-      console.info("[chat] GitHub adapter initialized")
-    } catch {
-      console.warn(
-        "[chat] Failed to create github adapter (check GITHUB_TOKEN or GITHUB_APP_ID/PRIVATE_KEY)"
-      );
-    }
-  }
+*/
+  
 
   return adapters;
 }
