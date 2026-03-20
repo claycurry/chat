@@ -22,7 +22,7 @@ import { ConsoleLogger } from "chat";
 import { recorder, withRecording } from "./recorder";
 
 // Create a shared logger for adapters that need explicit logger overrides
-const logger = new ConsoleLogger("info");
+const logger = new ConsoleLogger("debug");
 
 export interface Adapters {
   discord?: DiscordAdapter;
@@ -186,8 +186,16 @@ export function buildAdapters(): Adapters {
   }
 
   // GitHub adapter (optional) - env vars: GITHUB_WEBHOOK_SECRET + (GITHUB_TOKEN or GITHUB_APP_ID/PRIVATE_KEY)
+  console.log("[chat] GitHub env check:", {
+    hasWebhookSecret: !!process.env.GITHUB_WEBHOOK_SECRET,
+    hasToken: !!process.env.GITHUB_TOKEN,
+    hasAppId: !!process.env.GITHUB_APP_ID,
+    hasPrivateKey: !!process.env.GITHUB_PRIVATE_KEY,
+    hasInstallationId: !!process.env.GITHUB_INSTALLATION_ID,
+  });
   if (process.env.GITHUB_WEBHOOK_SECRET) {
     try {
+      console.log("[chat] Creating GitHub adapter...");
       adapters.github = withRecording(
         createGitHubAdapter({
           logger: logger.child("github"),
@@ -196,67 +204,17 @@ export function buildAdapters(): Adapters {
         "github",
         GITHUB_METHODS
       );
-    } catch {
-      console.warn(
-        "[chat] Failed to create github adapter (check GITHUB_TOKEN or GITHUB_APP_ID/PRIVATE_KEY)"
-      );
-    }
-  }
-
-  // Linear adapter (optional) - env vars: LINEAR_WEBHOOK_SECRET + (LINEAR_API_KEY or LINEAR_CLIENT_ID/SECRET)
-  if (process.env.LINEAR_WEBHOOK_SECRET) {
-    try {
-      adapters.linear = withRecording(
-        createLinearAdapter({
-          logger: logger.child("linear"),
-        }),
-        "linear",
-        LINEAR_METHODS
-      );
-    } catch {
-      console.warn(
-        "[chat] Failed to create linear adapter (check LINEAR_API_KEY or LINEAR_CLIENT_ID/SECRET)"
-      );
-    }
-  }
-
-  // Telegram adapter (optional) - env vars: TELEGRAM_BOT_TOKEN
-  if (process.env.TELEGRAM_BOT_TOKEN) {
-    adapters.telegram = withRecording(
-      createTelegramAdapter({
-        logger: logger.child("telegram"),
-      }),
-      "telegram",
-      TELEGRAM_METHODS
-    );
-  }
-
-  // WhatsApp adapter (optional) - env vars: WHATSAPP_ACCESS_TOKEN, WHATSAPP_APP_SECRET, WHATSAPP_PHONE_NUMBER_ID, WHATSAPP_VERIFY_TOKEN
-  console.log("[chat] WhatsApp env check:", {
-    hasAccessToken: !!process.env.WHATSAPP_ACCESS_TOKEN,
-    hasAppSecret: !!process.env.WHATSAPP_APP_SECRET,
-    hasPhoneNumberId: !!process.env.WHATSAPP_PHONE_NUMBER_ID,
-    hasVerifyToken: !!process.env.WHATSAPP_VERIFY_TOKEN,
-  });
-  if (
-    process.env.WHATSAPP_ACCESS_TOKEN &&
-    process.env.WHATSAPP_PHONE_NUMBER_ID
-  ) {
-    try {
-      adapters.whatsapp = withRecording(
-        createWhatsAppAdapter({
-          logger: logger.child("whatsapp"),
-        }),
-        "whatsapp",
-        WHATSAPP_METHODS
-      );
+      console.log("[chat] GitHub adapter created successfully");
     } catch (err) {
       console.warn(
-        "[chat] Failed to create whatsapp adapter:",
+        "[chat] Failed to create github adapter:",
         err instanceof Error ? err.message : err
       );
     }
   }
 
+
+  // WhatsApp adapter (optional) - env vars: WHATSAPP_ACCESS_TOKEN, WHATSAPP_APP_SECRET, WHATSAPP_PHONE_NUMBER_ID, WHATSAPP_VERIFY_TOKEN
+  
   return adapters;
 }
